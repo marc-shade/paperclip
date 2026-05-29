@@ -3039,6 +3039,32 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return Math.max(1, Math.floor(asNumber(raw, fallback)));
   }
 
+  async function reapResolvableRecoveryActions(opts?: { now?: Date }) {
+    const result = await recoveryActionsSvc.reapResolvableActions(opts);
+    for (const action of result.reaped) {
+      await logActivity(db, {
+        companyId: action.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.recovery_action_resolved",
+        entityType: "issue",
+        entityId: action.sourceIssueId,
+        details: {
+          source: action.reason === "timed_out"
+            ? "recovery.reap_timed_out_recovery_action"
+            : "recovery.reap_terminal_source_recovery_action",
+          recoveryActionId: action.id,
+          recoveryActionKind: action.kind,
+          outcome: "restored",
+          reason: action.reason,
+        },
+      });
+    }
+    return result;
+  }
+
   return {
     buildRunOutputSilence,
     escalateStrandedRecoveryIssueInPlace,
@@ -3046,6 +3072,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recordWatchdogDecision,
     scanSilentActiveRuns,
     reconcileStrandedAssignedIssues,
+    reapResolvableRecoveryActions,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileIssueGraphLiveness,
     readRecoveryTimerIntervalMs,

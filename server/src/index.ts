@@ -696,6 +696,12 @@ export async function startServer(): Promise<StartedServer> {
         }
       })
       .then(async () => {
+        const reaped = await heartbeat.reapResolvableRecoveryActions();
+        if (reaped.resolved > 0) {
+          logger.warn({ ...reaped, reaped: undefined }, "startup recovery reaper resolved stale recovery actions");
+        }
+      })
+      .then(async () => {
         const reconciled = await heartbeat.reconcileIssueGraphLiveness();
         if (reconciled.escalationsCreated > 0) {
           logger.warn({ ...reconciled }, "startup issue-graph liveness reconciliation created escalations");
@@ -759,6 +765,12 @@ export async function startServer(): Promise<StartedServer> {
               { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
               "periodic heartbeat recovery changed assigned issue state",
             );
+          }
+        })
+        .then(async () => {
+          const reaped = await heartbeat.reapResolvableRecoveryActions();
+          if (reaped.resolved > 0) {
+            logger.warn({ ...reaped, reaped: undefined }, "periodic recovery reaper resolved stale recovery actions");
           }
         })
         .then(async () => {
