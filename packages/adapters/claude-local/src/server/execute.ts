@@ -51,6 +51,7 @@ import {
   describeClaudeFailure,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
+  hasClaudeDeadSessionSignal,
   isClaudeMaxTurnsResult,
   isClaudeTransientUpstreamError,
   isClaudeUnknownSessionError,
@@ -943,16 +944,34 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   try {
     const initial = await runAttempt(sessionId ?? null);
-    if (
+    // Detect dead/expired sessions from any available signal: parsed JSON errors OR
+    // raw stdout/stderr text. The latter covers the case where Claude exits with 0 tokens
+    // and empty stdout — `initial.parsed` is null in that scenario and the parsed-only
+    // guard would silently retain the dead session, causing consecutive 0-token loops.
+    const hasDeadSessionSignal =
       sessionId &&
       !initial.proc.timedOut &&
       (initial.proc.exitCode ?? 0) !== 0 &&
-      initial.parsed &&
-      isClaudeUnknownSessionError(initial.parsed)
-    ) {
+      hasClaudeDeadSessionSignal({
+        parsed: initial.parsed,
+        stdout: initial.proc.stdout,
+        stderr: initial.proc.stderr,
+      });
+    // Secondary guard: if the resumed session produced ZERO output (no JSON, empty stdout)
+    // and Claude exited non-zero, treat it as a dead session regardless of error text.
+    // This is the "silent death" case where Claude crashes immediately on a dead session
+    // before emitting any stream events.
+    const isZeroOutputDeadSession =
+      sessionId &&
+      !initial.proc.timedOut &&
+      (initial.proc.exitCode ?? 0) !== 0 &&
+      !initial.parsed &&
+      initial.proc.stdout.trim().length === 0;
+    if (hasDeadSessionSignal || isZeroOutputDeadSession) {
+      const reason = isZeroOutputDeadSession ? "zero output on resume" : "unknown session error";
       await onLog(
         "stdout",
-        `[paperclip] Claude resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
+        `[paperclip] Claude resume session "${sessionId}" is unavailable (${reason}); retrying with a fresh session.\n`,
       );
       const retry = await runAttempt(null);
       return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });

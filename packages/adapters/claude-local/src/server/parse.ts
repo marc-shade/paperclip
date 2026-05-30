@@ -196,6 +196,24 @@ export function isClaudeUnknownSessionError(parsed: Record<string, unknown>): bo
   );
 }
 
+const CLAUDE_DEAD_SESSION_RE = /no conversation found with session id|unknown session|session .* not found/i;
+
+/**
+ * Detects a dead/expired Claude session from any available signal:
+ * parsed JSON error output OR raw stdout/stderr text. This covers the case
+ * where a dead session causes Claude to exit without producing any JSON
+ * (0 tokens, empty stdout), which `isClaudeUnknownSessionError` cannot detect.
+ */
+export function hasClaudeDeadSessionSignal(input: {
+  parsed?: Record<string, unknown> | null;
+  stdout?: string | null;
+  stderr?: string | null;
+}): boolean {
+  if (input.parsed && isClaudeUnknownSessionError(input.parsed)) return true;
+  const rawText = [input.stdout ?? "", input.stderr ?? ""].join("\n");
+  return CLAUDE_DEAD_SESSION_RE.test(rawText);
+}
+
 function buildClaudeTransientHaystack(input: {
   parsed?: Record<string, unknown> | null;
   stdout?: string | null;

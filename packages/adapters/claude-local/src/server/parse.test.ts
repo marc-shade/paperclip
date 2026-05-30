@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   extractClaudeRetryNotBefore,
+  hasClaudeDeadSessionSignal,
   isClaudeTransientUpstreamError,
 } from "./parse.js";
 
@@ -119,5 +120,55 @@ describe("extractClaudeRetryNotBefore", () => {
     expect(
       extractClaudeRetryNotBefore({ errorMessage: "Overloaded. Try again later." }, new Date()),
     ).toBeNull();
+  });
+});
+
+describe("hasClaudeDeadSessionSignal", () => {
+  it("detects dead session from parsed JSON error", () => {
+    expect(
+      hasClaudeDeadSessionSignal({
+        parsed: {
+          is_error: true,
+          result: "No conversation found with session id abc-123.",
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("detects dead session from raw stderr when parsed is null", () => {
+    expect(
+      hasClaudeDeadSessionSignal({
+        parsed: null,
+        stderr: "Error: no conversation found with session id deadbeef",
+      }),
+    ).toBe(true);
+  });
+
+  it("detects dead session from raw stdout when parsed is null", () => {
+    expect(
+      hasClaudeDeadSessionSignal({
+        parsed: null,
+        stdout: "unknown session: session abc123 not found",
+      }),
+    ).toBe(true);
+  });
+
+  it("returns false for unrelated failures with empty output", () => {
+    expect(
+      hasClaudeDeadSessionSignal({
+        parsed: null,
+        stdout: "",
+        stderr: "",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false for transient upstream errors", () => {
+    expect(
+      hasClaudeDeadSessionSignal({
+        parsed: null,
+        stderr: "Error: Rate limit exceeded. Try again later.",
+      }),
+    ).toBe(false);
   });
 });
