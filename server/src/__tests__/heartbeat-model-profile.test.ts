@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { AdapterModelProfileDefinition } from "../adapters/index.js";
 import {
+  mergeProviderCascadeAdapterConfig,
   mergeModelProfileAdapterConfig,
   normalizeModelProfileWakeContext,
+  resolveProviderCascadeApplication,
   resolveModelProfileApplication,
+  selectNextProviderCascadeEntry,
 } from "../services/heartbeat.ts";
 
 const cheapProfile: AdapterModelProfileDefinition = {
@@ -119,5 +122,85 @@ describe("heartbeat model profile application", () => {
     });
 
     expect(contextSnapshot).toMatchObject({ modelProfile: "cheap" });
+  });
+});
+
+describe("heartbeat provider cascade application", () => {
+  const runtimeConfig = {
+    providerCascade: {
+      enabled: true,
+      entries: [
+        {
+          label: "Codex fallback",
+          adapterType: "codex_local",
+          adapterConfig: {
+            model: "gpt-5.5",
+            modelReasoningEffort: "high",
+          },
+        },
+        {
+          label: "Gemini fallback",
+          adapterType: "gemini_local",
+          adapterConfig: {
+            model: "gemini-2.5-pro",
+          },
+        },
+      ],
+    },
+  };
+
+  it("uses the cascade-selected adapter and config when run context names an active entry", () => {
+    const providerCascade = resolveProviderCascadeApplication({
+      agentAdapterType: "claude_local",
+      agentRuntimeConfig: runtimeConfig,
+      contextSnapshot: {
+        providerCascade: {
+          activeIndex: 0,
+        },
+      },
+    });
+
+    const merged = mergeProviderCascadeAdapterConfig({
+      baseConfig: {
+        cwd: "/repo",
+        model: "claude-opus-4-7",
+      },
+      providerCascade,
+    });
+
+    expect(providerCascade).toMatchObject({
+      activeIndex: 0,
+      adapterType: "codex_local",
+      entry: {
+        label: "Codex fallback",
+      },
+      fallbackReason: null,
+    });
+    expect(merged).toEqual({
+      cwd: "/repo",
+      model: "gpt-5.5",
+      modelReasoningEffort: "high",
+    });
+  });
+
+  it("selects the next configured fallback after the active cascade entry", () => {
+    const next = selectNextProviderCascadeEntry({
+      agentAdapterType: "claude_local",
+      agentRuntimeConfig: runtimeConfig,
+      contextSnapshot: {
+        providerCascade: {
+          activeIndex: 0,
+        },
+      },
+    });
+
+    expect(next).toMatchObject({
+      totalEntries: 2,
+      entry: {
+        index: 1,
+        adapterType: "gemini_local",
+        label: "Gemini fallback",
+      },
+    });
   });
 });

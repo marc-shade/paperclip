@@ -138,6 +138,7 @@ import {
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
 import {
+  RECOVERY_MODEL_PROFILE_KEY,
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
@@ -220,6 +221,8 @@ const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
+const PROVIDER_CASCADE_RETRY_REASON = "provider_cascade_retry";
+const PROVIDER_CASCADE_WAKE_REASON = "provider_cascade_retry";
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
@@ -309,6 +312,187 @@ function mergeAdapterRecoveryMetadata(input: {
         }
       : {}),
   };
+}
+
+type ProviderCascadeEntry = {
+  index: number;
+  label: string | null;
+  adapterType: string;
+  adapterConfig: Record<string, unknown>;
+};
+
+type ProviderCascadeApplication = {
+  activeIndex: number | null;
+  adapterType: string;
+  entry: ProviderCascadeEntry | null;
+  fallbackReason: string | null;
+};
+
+const DEFAULT_PROVIDER_CASCADE_MODELS = {
+  codex: "gpt-5.5",
+  gemini: "gemini-2.5-pro",
+  claude: "claude-sonnet-4-6",
+} as const;
+
+function defaultProviderCascadeEntries(agentAdapterType: string): ProviderCascadeEntry[] {
+  const codex = {
+    label: "Codex GPT-5.5",
+    adapterType: "codex_local",
+    adapterConfig: {
+      command: "codex",
+      model: DEFAULT_PROVIDER_CASCADE_MODELS.codex,
+      modelReasoningEffort: "high",
+      dangerouslyBypassApprovalsAndSandbox: true,
+    },
+  };
+  const gemini = {
+    label: "Gemini 2.5 Pro",
+    adapterType: "gemini_local",
+    adapterConfig: {
+      command: "gemini",
+      model: DEFAULT_PROVIDER_CASCADE_MODELS.gemini,
+      sandbox: false,
+    },
+  };
+  const claude = {
+    label: "Claude Sonnet",
+    adapterType: "claude_local",
+    adapterConfig: {
+      command: "claude",
+      model: DEFAULT_PROVIDER_CASCADE_MODELS.claude,
+      effort: "high",
+      dangerouslySkipPermissions: true,
+    },
+  };
+  const ordered =
+    agentAdapterType === "claude_local" ? [codex, gemini]
+      : agentAdapterType === "codex_local" ? [gemini, claude]
+        : agentAdapterType === "gemini_local" ? [codex, claude]
+          : [codex, gemini, claude].filter((entry) => entry.adapterType !== agentAdapterType);
+  return ordered.map((entry, index) => ({ index, ...entry }));
+}
+
+function parseProviderCascadeEntries(input: {
+  agentAdapterType: string;
+  runtimeConfig: unknown;
+}): ProviderCascadeEntry[] {
+  const runtimeConfig = parseObject(input.runtimeConfig);
+  const providerCascade = parseObject(parseObject(runtimeConfig).providerCascade);
+  if (providerCascade.enabled === false) return [];
+  const rawEntries = Array.isArray(providerCascade.entries) ? providerCascade.entries : null;
+  if (!rawEntries) return defaultProviderCascadeEntries(input.agentAdapterType);
+
+  const entries: ProviderCascadeEntry[] = [];
+
+  rawEntries.forEach((rawEntry, index) => {
+    const entry = parseObject(rawEntry);
+    if (entry.enabled === false) return;
+    const adapterType = readNonEmptyString(entry.adapterType);
+    if (!adapterType) return;
+    entries.push({
+      index,
+      label: readNonEmptyString(entry.label),
+      adapterType,
+      adapterConfig: parseObject(entry.adapterConfig),
+    });
+  });
+
+  return entries;
+}
+
+function readProviderCascadeActiveIndex(contextSnapshot: Record<string, unknown> | null | undefined) {
+  const providerCascade = parseObject(contextSnapshot?.providerCascade);
+  const rawIndex = providerCascade.activeIndex;
+  if (typeof rawIndex === "number" && Number.isInteger(rawIndex) && rawIndex >= 0) return rawIndex;
+  if (typeof rawIndex === "string" && rawIndex.trim().length > 0) {
+    const parsed = Number(rawIndex);
+    if (Number.isInteger(parsed) && parsed >= 0) return parsed;
+  }
+  return null;
+}
+
+export function resolveProviderCascadeApplication(input: {
+  agentAdapterType: string;
+  agentRuntimeConfig: unknown;
+  contextSnapshot: Record<string, unknown> | null | undefined;
+}): ProviderCascadeApplication {
+  const activeIndex = readProviderCascadeActiveIndex(input.contextSnapshot);
+  if (activeIndex === null) {
+    return {
+      activeIndex: null,
+      adapterType: input.agentAdapterType,
+      entry: null,
+      fallbackReason: null,
+    };
+  }
+
+  const entry = parseProviderCascadeEntries({
+    agentAdapterType: input.agentAdapterType,
+    runtimeConfig: input.agentRuntimeConfig,
+  })
+    .find((candidate) => candidate.index === activeIndex) ?? null;
+  if (!entry) {
+    return {
+      activeIndex,
+      adapterType: input.agentAdapterType,
+      entry: null,
+      fallbackReason: "provider_cascade_entry_not_configured",
+    };
+  }
+
+  return {
+    activeIndex,
+    adapterType: entry.adapterType,
+    entry,
+    fallbackReason: null,
+  };
+}
+
+export function mergeProviderCascadeAdapterConfig(input: {
+  baseConfig: Record<string, unknown>;
+  providerCascade: ProviderCascadeApplication;
+}): Record<string, unknown> {
+  if (!input.providerCascade.entry) return input.baseConfig;
+  return {
+    ...input.baseConfig,
+    ...input.providerCascade.entry.adapterConfig,
+  };
+}
+
+function providerCascadeRunMetadata(
+  providerCascade: ProviderCascadeApplication,
+): Record<string, unknown> | null {
+  if (providerCascade.activeIndex === null) return null;
+  return {
+    activeIndex: providerCascade.activeIndex,
+    adapterType: providerCascade.adapterType,
+    label: providerCascade.entry?.label ?? null,
+    applied: providerCascade.entry !== null,
+    fallbackReason: providerCascade.fallbackReason,
+  };
+}
+
+export function selectNextProviderCascadeEntry(input: {
+  agentAdapterType: string;
+  agentRuntimeConfig: unknown;
+  contextSnapshot: Record<string, unknown> | null | undefined;
+}): { entry: ProviderCascadeEntry; totalEntries: number } | null {
+  const entries = parseProviderCascadeEntries({
+    agentAdapterType: input.agentAdapterType,
+    runtimeConfig: input.agentRuntimeConfig,
+  });
+  if (entries.length === 0) return null;
+  const activeIndex = readProviderCascadeActiveIndex(input.contextSnapshot);
+  const nextEntry = entries.find((entry) => entry.index > (activeIndex ?? -1)) ?? null;
+  if (!nextEntry) return null;
+  return { entry: nextEntry, totalEntries: entries.length };
+}
+
+function applyOptionalRecoveryModelProfileHint<T extends Record<string, unknown>>(
+  input: T,
+  enabled: boolean,
+): T | (T & { modelProfile: typeof RECOVERY_MODEL_PROFILE_KEY }) {
+  return enabled ? withRecoveryModelProfileHint(input) : input;
 }
 const RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP = new Set(["approval_approved"]);
 const SESSIONED_LOCAL_ADAPTERS = new Set([
@@ -1172,6 +1356,18 @@ function mergeModelProfileRunMetadata(
   return {
     ...(resultJson ?? {}),
     modelProfile: metadata,
+  };
+}
+
+function mergeProviderCascadeRunMetadata(
+  resultJson: Record<string, unknown> | null,
+  providerCascade: ProviderCascadeApplication,
+): Record<string, unknown> | null {
+  const metadata = providerCascadeRunMetadata(providerCascade);
+  if (!metadata) return resultJson;
+  return {
+    ...(resultJson ?? {}),
+    providerCascade: metadata,
   };
 }
 
@@ -5115,11 +5311,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       wakeReason?: string;
       maxAttempts?: number;
       delayMs?: number;
+      contextPatch?: Record<string, unknown>;
+      recoveryModelProfileHint?: boolean;
     },
   ) {
     const now = opts?.now ?? new Date();
     const retryReason = opts?.retryReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON;
     const wakeReason = opts?.wakeReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON;
+    const recoveryModelProfileHint = opts?.recoveryModelProfileHint !== false;
+    const contextPatch = parseObject(opts?.contextPatch);
     const maxAttempts = Math.max(0, Math.floor(opts?.maxAttempts ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS));
     const nextAttempt = (run.scheduledRetryAttempt ?? 0) + 1;
     const baseSchedule = opts?.delayMs != null
@@ -5199,8 +5399,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
-    const retryContextSnapshot: Record<string, unknown> = withRecoveryModelProfileHint({
+    const retryContextSnapshot: Record<string, unknown> = applyOptionalRecoveryModelProfileHint({
       ...contextSnapshot,
+      ...contextPatch,
       retryOfRunId: run.id,
       wakeReason,
       retryReason,
@@ -5209,7 +5410,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       scheduledRetryAt: schedule.dueAt.toISOString(),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
-    });
+    }, recoveryModelProfileHint);
     const maxTurnContinuationIdempotencyKey = retryReason === MAX_TURN_CONTINUATION_RETRY_REASON
       ? `max-turn-continuation:${run.companyId}:${issueId ?? "no-issue"}:${run.id}:${schedule.attempt}`
       : null;
@@ -5370,8 +5571,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           source: "automation",
           triggerDetail: "system",
           reason: wakeReason,
-          payload: withRecoveryModelProfileHint({
+          payload: applyOptionalRecoveryModelProfileHint({
             ...(issueId ? { issueId } : {}),
+            ...contextPatch,
             retryOfRunId: run.id,
             retryReason,
             ...(transientRecovery ? { errorFamily: transientRecovery.errorFamily } : {}),
@@ -5379,7 +5581,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             scheduledRetryAt: schedule.dueAt.toISOString(),
             ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
             ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
-          }),
+          }, recoveryModelProfileHint),
           status: "queued",
           requestedByActorType: "system",
           requestedByActorId: null,
@@ -5511,6 +5713,98 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       attempt: schedule.attempt,
       maxAttempts: schedule.maxAttempts,
     };
+  }
+
+  async function scheduleProviderCascadeRetryForRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+  ) {
+    const contextSnapshot = parseObject(run.contextSnapshot);
+    const entries = parseProviderCascadeEntries({
+      agentAdapterType: agent.adapterType,
+      runtimeConfig: agent.runtimeConfig,
+    });
+    if (entries.length === 0) {
+      return { outcome: "not_configured" as const };
+    }
+
+    const next = selectNextProviderCascadeEntry({
+      agentAdapterType: agent.adapterType,
+      agentRuntimeConfig: agent.runtimeConfig,
+      contextSnapshot,
+    });
+    if (!next) {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Provider cascade exhausted; no further automatic provider fallback will be queued",
+        payload: {
+          retryReason: PROVIDER_CASCADE_RETRY_REASON,
+          activeIndex: readProviderCascadeActiveIndex(contextSnapshot),
+          totalEntries: entries.length,
+        },
+      });
+      return { outcome: "exhausted" as const };
+    }
+
+    const providerCascadeContext = parseObject(contextSnapshot.providerCascade);
+    const transientRecovery = readTransientRecoveryContractFromRun(run);
+    const rawHistory = Array.isArray(providerCascadeContext.history)
+      ? providerCascadeContext.history.filter((entry): entry is Record<string, unknown> =>
+          typeof entry === "object" && entry !== null && !Array.isArray(entry),
+        )
+      : [];
+    const nextProviderCascadeContext = {
+      ...providerCascadeContext,
+      activeIndex: next.entry.index,
+      activeAdapterType: next.entry.adapterType,
+      activeLabel: next.entry.label,
+      previousRunId: run.id,
+      reason: "transient_upstream",
+      history: [
+        ...rawHistory,
+        {
+          runId: run.id,
+          adapterType: readNonEmptyString(providerCascadeContext.activeAdapterType) ?? agent.adapterType,
+          activeIndex: readProviderCascadeActiveIndex(contextSnapshot),
+          errorCode: run.errorCode,
+          ...(transientRecovery?.retryNotBefore
+            ? { retryNotBefore: transientRecovery.retryNotBefore.toISOString() }
+            : {}),
+        },
+      ],
+    };
+
+    const result = await scheduleBoundedRetryForRun(run, agent, {
+      retryReason: PROVIDER_CASCADE_RETRY_REASON,
+      wakeReason: PROVIDER_CASCADE_WAKE_REASON,
+      maxAttempts: next.totalEntries,
+      delayMs: 0,
+      recoveryModelProfileHint: false,
+      contextPatch: {
+        providerCascade: nextProviderCascadeContext,
+      },
+    });
+
+    if (result.outcome === "scheduled") {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: `Provider cascade scheduled fallback adapter ${next.entry.adapterType}`,
+        payload: {
+          retryRunId: result.run.id,
+          activeIndex: next.entry.index,
+          adapterType: next.entry.adapterType,
+          label: next.entry.label,
+        },
+      });
+    }
+
+    return result.outcome === "retry_exhausted"
+      ? { ...result, outcome: "exhausted" as const }
+      : result;
   }
 
   async function promoteDueScheduledRetries(now = new Date()) {
@@ -6642,6 +6936,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     result: AdapterExecutionResult,
     session: { legacySessionId: string | null },
     normalizedUsage?: UsageTotals | null,
+    adapterTypeOverride?: string | null,
   ) {
     await ensureRuntimeState(agent);
     const usage = normalizedUsage ?? normalizeUsageTotals(result.usage);
@@ -6658,7 +6953,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     await db
       .update(agentRuntimeState)
       .set({
-        adapterType: agent.adapterType,
+        adapterType: adapterTypeOverride ?? agent.adapterType,
         sessionId: session.legacySessionId,
         lastRunId: run.id,
         lastRunStatus: run.status,
@@ -6799,8 +7094,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const runtime = await ensureRuntimeState(agent);
     const context = parseObject(run.contextSnapshot);
+    const baseAgentAdapterConfig = parseObject(agent.adapterConfig);
+    const providerCascadeApplication = resolveProviderCascadeApplication({
+      agentAdapterType: agent.adapterType,
+      agentRuntimeConfig: agent.runtimeConfig,
+      contextSnapshot: context,
+    });
+    const effectiveAdapterType = providerCascadeApplication.adapterType;
     const taskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
-    const sessionCodec = getAdapterSessionCodec(agent.adapterType);
+    const sessionCodec = getAdapterSessionCodec(effectiveAdapterType);
     const issueId = readNonEmptyString(context.issueId);
     let issueContext = issueId ? await getIssueExecutionContext(agent.companyId, issueId) : null;
     const issueDependencyReadiness = issueId
@@ -6875,7 +7177,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       isolatedWorkspacesEnabled,
     );
     const taskSession = taskKey
-      ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey)
+      ? await getTaskSession(agent.companyId, agent.id, effectiveAdapterType, taskKey)
       : null;
     const resetTaskSession = shouldResetTaskSessionForWake(context);
     const sessionResetReason = describeSessionResetReason(context);
@@ -6892,7 +7194,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       explicitResumeSessionParams ??
       (explicitResumeSessionDisplayId ? { sessionId: explicitResumeSessionDisplayId } : null) ??
       normalizeSessionParams(sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? null));
-    const config = parseObject(agent.adapterConfig);
+    const config = mergeProviderCascadeAdapterConfig({
+      baseConfig: baseAgentAdapterConfig,
+      providerCascade: providerCascadeApplication,
+    });
     const requestedExecutionWorkspaceMode = resolveExecutionWorkspaceMode({
       projectPolicy: projectExecutionWorkspacePolicy,
       issueSettings: issueExecutionWorkspaceSettings,
@@ -6980,6 +7285,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } else {
       delete context.paperclipIssue;
     }
+    const providerCascadeMetadata = providerCascadeRunMetadata(providerCascadeApplication);
+    if (providerCascadeMetadata) {
+      context.paperclipProviderCascade = providerCascadeMetadata;
+    } else {
+      delete context.paperclipProviderCascade;
+    }
     if (wakeCommentContext) {
       context.paperclipWakeComment = wakeCommentContext;
     } else {
@@ -7033,7 +7344,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let adapterModelProfiles: AdapterModelProfileDefinition[] = [];
     let profileResolutionFallbackReason: string | null = null;
     try {
-      adapterModelProfiles = await listAdapterModelProfiles(agent.adapterType);
+      adapterModelProfiles = await listAdapterModelProfiles(effectiveAdapterType);
     } catch (error) {
       profileResolutionFallbackReason = "adapter_profile_resolution_failed";
       logger.warn(
@@ -7041,7 +7352,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           err: error,
           companyId: agent.companyId,
           agentId: agent.id,
-          adapterType: agent.adapterType,
+          adapterType: effectiveAdapterType,
           runId: run.id,
         },
         "Failed to resolve adapter model profiles; falling back to primary adapter config",
@@ -7049,7 +7360,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
     const modelProfileApplication = resolveModelProfileApplication({
       adapterModelProfiles,
-      agentRuntimeConfig: agent.runtimeConfig,
+      agentRuntimeConfig: providerCascadeApplication.entry ? {} : agent.runtimeConfig,
       issueModelProfile: issueAssigneeOverrides?.modelProfile ?? null,
       contextSnapshot: context,
       profileResolutionFallbackReason,
@@ -7064,7 +7375,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const mergedConfig = mergeModelProfileAdapterConfig({
       baseConfig: persistedWorkspaceManagedConfig,
       modelProfile: modelProfileApplication,
-      issueAdapterConfig: issueAssigneeOverrides?.adapterConfig ?? null,
+      issueAdapterConfig: providerCascadeApplication.entry ? null : (issueAssigneeOverrides?.adapterConfig ?? null),
     });
     const configSnapshot = buildExecutionWorkspaceConfigSnapshot(mergedConfig, selectedEnvironmentId);
     const executionRunConfig = stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig);
@@ -7273,7 +7584,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       companyId: agent.companyId,
       selectedEnvironmentId: persistedEnvironmentId,
       defaultEnvironmentId: defaultEnvironment.id,
-      adapterType: agent.adapterType,
+      adapterType: effectiveAdapterType,
       issueId: issueId ?? null,
       heartbeatRunId: run.id,
       agentId: agent.id,
@@ -7288,7 +7599,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const realizationResult = await envOrchestrator.realizeForRun({
       environment: selectedEnvironment,
       lease: activeEnvironmentLease.lease,
-      adapterType: agent.adapterType,
+      adapterType: effectiveAdapterType,
       companyId: agent.companyId,
       issueId: issueId ?? null,
       heartbeatRunId: run.id,
@@ -7638,6 +7949,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
         const modelProfileMetadata = modelProfileRunMetadata(modelProfileApplication);
+        const providerCascadeMetadata = providerCascadeRunMetadata(providerCascadeApplication);
         await appendRunEvent(currentRun, seq++, {
           eventType: "adapter.invoke",
           stream: "system",
@@ -7646,13 +7958,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           payload: {
             ...(meta as unknown as Record<string, unknown>),
             ...(modelProfileMetadata ? { modelProfile: modelProfileMetadata } : {}),
+            ...(providerCascadeMetadata ? { providerCascade: providerCascadeMetadata } : {}),
           },
         });
       };
 
-      const adapter = getServerAdapter(agent.adapterType);
+      const adapter = getServerAdapter(effectiveAdapterType);
       const authToken = adapter.supportsLocalAgentJwt
-        ? createLocalAgentJwt(agent.id, agent.companyId, agent.adapterType, run.id)
+        ? createLocalAgentJwt(agent.id, agent.companyId, effectiveAdapterType, run.id)
         : null;
       if (adapter.supportsLocalAgentJwt && !authToken) {
         logger.warn(
@@ -7660,7 +7973,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             companyId: agent.companyId,
             agentId: agent.id,
             runId: run.id,
-            adapterType: agent.adapterType,
+            adapterType: effectiveAdapterType,
           },
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
@@ -7693,7 +8006,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const adapterManagedRuntimeServices = adapterResult.runtimeServices
         ? await persistAdapterManagedRuntimeServices({
             db,
-            adapterType: agent.adapterType,
+            adapterType: effectiveAdapterType,
             runId: run.id,
             agent: {
               id: agent.id,
@@ -7830,13 +8143,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const persistedResultJson = mergeHeartbeatRunResultJson(
         mergeRunStopMetadataForAgent(agent, outcome, {
-          resultJson: mergeModelProfileRunMetadata(
-            mergeAdapterRecoveryMetadata({
-              resultJson: adapterResult.resultJson ?? null,
-              errorFamily: adapterResult.errorFamily ?? null,
-              retryNotBefore: adapterResult.retryNotBefore ?? null,
-            }),
-            modelProfileApplication,
+          resultJson: mergeProviderCascadeRunMetadata(
+            mergeModelProfileRunMetadata(
+              mergeAdapterRecoveryMetadata({
+                resultJson: adapterResult.resultJson ?? null,
+                errorFamily: adapterResult.errorFamily ?? null,
+                retryNotBefore: adapterResult.retryNotBefore ?? null,
+              }),
+              modelProfileApplication,
+            ),
+            providerCascadeApplication,
           ),
           errorCode: runErrorCode,
           errorMessage: runErrorMessage,
@@ -7921,7 +8237,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             });
           }
         } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
-          await scheduleBoundedRetryForRun(livenessRun, agent);
+          const providerCascadeRetry = await scheduleProviderCascadeRetryForRun(livenessRun, agent);
+          if (providerCascadeRetry.outcome === "not_configured") {
+            await scheduleBoundedRetryForRun(livenessRun, agent);
+          }
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
         await releaseIssueExecutionAndPromote(livenessRun);
@@ -7940,18 +8259,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (finalizedRun) {
         await updateRuntimeState(agent, finalizedRun, adapterResult, {
           legacySessionId: nextSessionState.legacySessionId,
-        }, normalizedUsage);
+        }, normalizedUsage, effectiveAdapterType);
         if (taskKey) {
           if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
             await clearTaskSessions(agent.companyId, agent.id, {
               taskKey,
-              adapterType: agent.adapterType,
+              adapterType: effectiveAdapterType,
             });
           } else {
             await upsertTaskSession({
               companyId: agent.companyId,
               agentId: agent.id,
-              adapterType: agent.adapterType,
+              adapterType: effectiveAdapterType,
               taskKey,
               sessionParamsJson: nextSessionState.params,
               sessionDisplayId: nextSessionState.displayId,
@@ -8023,13 +8342,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           errorMessage: message,
         }, {
           legacySessionId: runtimeForAdapter.sessionId,
-        });
+        }, undefined, effectiveAdapterType);
 
         if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
           await upsertTaskSession({
             companyId: agent.companyId,
             agentId: agent.id,
-            adapterType: agent.adapterType,
+            adapterType: effectiveAdapterType,
             taskKey,
             sessionParamsJson: previousSessionParams,
             sessionDisplayId: previousSessionDisplayId,

@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { parseGeminiJsonl } from "./parse.js";
+import {
+  detectGeminiAuthRequired,
+  detectGeminiQuotaExhausted,
+  parseGeminiJsonl,
+} from "./parse.js";
 
 describe("parseGeminiJsonl", () => {
   it("collects assistant text from message events with string content", () => {
@@ -129,5 +133,41 @@ describe("parseGeminiJsonl", () => {
 
     const result = parseGeminiJsonl(stdout);
     expect(result.errorMessage).toBe("boom");
+  });
+});
+
+describe("Gemini fallback error classification", () => {
+  it("classifies quota and rate-limit failures as provider-exhaustion candidates", () => {
+    expect(
+      detectGeminiQuotaExhausted({
+        parsed: {
+          status: "error",
+          error: "RESOURCE_EXHAUSTED: quota exceeded. Retry later.",
+        },
+        stdout: "",
+        stderr: "",
+      }).exhausted,
+    ).toBe(true);
+    expect(
+      detectGeminiQuotaExhausted({
+        parsed: null,
+        stdout: "",
+        stderr: "429 Too Many Requests",
+      }).exhausted,
+    ).toBe(true);
+  });
+
+  it("keeps auth failures out of provider-exhaustion classification", () => {
+    const input = {
+      parsed: {
+        status: "error",
+        error: "Authentication required. Run `gemini auth login` first.",
+      },
+      stdout: "",
+      stderr: "",
+    };
+
+    expect(detectGeminiAuthRequired(input).requiresAuth).toBe(true);
+    expect(detectGeminiQuotaExhausted(input).exhausted).toBe(false);
   });
 });

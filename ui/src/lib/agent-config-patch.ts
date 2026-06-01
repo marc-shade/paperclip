@@ -35,6 +35,12 @@ function omitUndefinedEntries(value: Record<string, unknown>) {
   );
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
 export function buildAgentUpdatePatch(agent: Agent, overlay: AgentConfigOverlay) {
   const patch: Record<string, unknown> = {};
 
@@ -111,7 +117,26 @@ export function buildAgentUpdatePatch(agent: Agent, overlay: AgentConfigOverlay)
   }
 
   if (Object.keys(overlay.runtime).length > 0) {
-    Object.assign(patch, overlay.runtime);
+    const { runtimeConfig: runtimeConfigOverlay, ...runtimeFields } = overlay.runtime;
+    const runtimeConfigRecord = asRecord(runtimeConfigOverlay);
+    if (runtimeConfigRecord) {
+      const pendingRuntimeConfig = asRecord(patch.runtimeConfig);
+      const nextRuntimeConfig: Record<string, unknown> = { ...runtimeConfigRecord };
+      if (pendingRuntimeConfig?.heartbeat !== undefined) {
+        nextRuntimeConfig.heartbeat = pendingRuntimeConfig.heartbeat;
+      }
+      if (hasModelProfileChange) {
+        if (pendingRuntimeConfig?.modelProfiles !== undefined) {
+          nextRuntimeConfig.modelProfiles = pendingRuntimeConfig.modelProfiles;
+        } else {
+          delete nextRuntimeConfig.modelProfiles;
+        }
+      }
+      patch.runtimeConfig = nextRuntimeConfig;
+    } else if (Object.prototype.hasOwnProperty.call(overlay.runtime, "runtimeConfig")) {
+      patch.runtimeConfig = runtimeConfigOverlay;
+    }
+    Object.assign(patch, runtimeFields);
   }
 
   return patch;

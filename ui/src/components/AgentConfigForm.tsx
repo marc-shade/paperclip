@@ -27,6 +27,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
 import { FolderOpen, Heart, ChevronDown, X } from "lucide-react";
 import { asBoolean, asFiniteNumber, asObject, cn } from "../lib/utils";
 import { extractModelName, extractProviderId } from "../lib/model-utils";
@@ -190,6 +191,24 @@ function clampDelayMsFromSeconds(value: number) {
   return clampInteger(value, 0, MAX_TURN_CONTINUATION_MAX_DELAY_SEC) * 1000;
 }
 
+function formatProviderCascadeJson(value: unknown): string {
+  const fallback = {
+    enabled: true,
+    entries: [],
+  };
+  return JSON.stringify(value && typeof value === "object" ? value : fallback, null, 2);
+}
+
+function parseProviderCascadeJson(value: string): Record<string, unknown> | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = JSON.parse(trimmed) as unknown;
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("Provider fallback cascade must be a JSON object.");
+  }
+  return parsed as Record<string, unknown>;
+}
+
 
 /* ---- Form ---- */
 
@@ -307,8 +326,21 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
 
   // ---- Resolve values ----
   const config = !isCreate ? ((props.agent.adapterConfig ?? {}) as Record<string, unknown>) : {};
-  const runtimeConfig = !isCreate ? ((props.agent.runtimeConfig ?? {}) as Record<string, unknown>) : {};
+  const baseRuntimeConfig = !isCreate ? ((props.agent.runtimeConfig ?? {}) as Record<string, unknown>) : {};
+  const runtimeConfig: Record<string, unknown> = !isCreate
+    ? eff("runtime", "runtimeConfig", baseRuntimeConfig)
+    : {};
   const heartbeat = !isCreate ? ((runtimeConfig.heartbeat ?? {}) as Record<string, unknown>) : {};
+  const [providerCascadeDraft, setProviderCascadeDraft] = useState(() =>
+    formatProviderCascadeJson(runtimeConfig.providerCascade),
+  );
+  const [providerCascadeError, setProviderCascadeError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (isCreate || isDirty) return;
+    setProviderCascadeDraft(formatProviderCascadeJson(runtimeConfig.providerCascade));
+    setProviderCascadeError(null);
+  }, [isCreate, isDirty, runtimeConfig.providerCascade]);
 
   const adapterType = isCreate
     ? props.values.adapterType
@@ -682,6 +714,23 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       ...maxTurnContinuation,
       ...patch,
     });
+  }
+
+  function applyProviderCascadeDraft() {
+    if (isCreate) return;
+    try {
+      const parsed = parseProviderCascadeJson(providerCascadeDraft);
+      const nextRuntimeConfig = { ...runtimeConfig };
+      if (parsed) {
+        nextRuntimeConfig.providerCascade = parsed;
+      } else {
+        delete nextRuntimeConfig.providerCascade;
+      }
+      mark("runtime", "runtimeConfig", nextRuntimeConfig);
+      setProviderCascadeError(null);
+    } catch (error) {
+      setProviderCascadeError(error instanceof Error ? error.message : "Provider fallback cascade JSON is invalid.");
+    }
   }
 
   return (
@@ -1286,6 +1335,35 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                     </Field>
                   </div>
                 ) : null}
+              </div>
+              <div className="rounded-md border border-border/70 px-3 py-2">
+                <Field label="Provider fallback cascade" hint="Ordered adapter/model candidates used after quota or rate-limit exhaustion.">
+                  <Textarea
+                    value={providerCascadeDraft}
+                    onChange={(event) => setProviderCascadeDraft(event.target.value)}
+                    className="min-h-32 font-mono text-xs"
+                    spellCheck={false}
+                  />
+                </Field>
+                {providerCascadeError ? (
+                  <p className="mt-2 text-xs text-destructive">{providerCascadeError}</p>
+                ) : null}
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <Button type="button" size="sm" variant="outline" onClick={applyProviderCascadeDraft}>
+                    Apply cascade JSON
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => {
+                      setProviderCascadeDraft("");
+                      setProviderCascadeError(null);
+                    }}
+                  >
+                    Clear
+                  </Button>
+                </div>
               </div>
             </div>
           </CollapsibleSection>

@@ -51,6 +51,7 @@ import { DEFAULT_GEMINI_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js
 import {
   describeGeminiFailure,
   detectGeminiAuthRequired,
+  detectGeminiQuotaExhausted,
   isGeminiTurnLimitResult,
   isGeminiUnknownSessionError,
   parseGeminiJsonl,
@@ -493,8 +494,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     apiAccessNote,
     renderedPrompt,
   ]);
+  const invocationPrompt = prompt.length > 0 ? prompt : "Continue from the last context.";
   const promptMetrics = {
-    promptChars: prompt.length,
+    promptChars: invocationPrompt.length,
     instructionsChars: instructionsPrefix.length,
     bootstrapPromptChars: renderedBootstrapPrompt.length,
     wakePromptChars: wakePrompt.length,
@@ -503,7 +505,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     heartbeatPromptChars: renderedPrompt.length,
   };
 
+  // agy (Google Antigravity CLI) has a Claude-like interface and does not support
+  // --output-format, --approval-mode, --sandbox=none, --model, or --resume.
+  const isAgyCLI = command === "agy";
+
   const buildArgs = (resumeSessionId: string | null) => {
+    if (isAgyCLI) {
+      const args: string[] = [];
+      args.push("--dangerously-skip-permissions");
+      if (sandbox) args.push("--sandbox");
+      if (extraArgs.length > 0) args.push(...extraArgs);
+      args.push("--print", invocationPrompt);
+      return args;
+    }
     const args = ["--output-format", "stream-json"];
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     if (model && model !== DEFAULT_GEMINI_LOCAL_MODEL) args.push("--model", model);
@@ -514,7 +528,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       args.push("--sandbox=none");
     }
     if (extraArgs.length > 0) args.push(...extraArgs);
-    args.push("--prompt", prompt);
+    args.push("--prompt", invocationPrompt);
     return args;
   };
 
@@ -527,10 +541,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         cwd: effectiveExecutionCwd,
         commandNotes,
         commandArgs: args.map((value, index) => (
-          index === args.length - 1 ? `<prompt ${prompt.length} chars>` : value
+          index === args.length - 1 ? `<prompt ${invocationPrompt.length} chars>` : value
         )),
         env: loggedEnv,
-        prompt,
+        prompt: invocationPrompt,
         promptMetrics,
         context,
       });
@@ -546,7 +560,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
     return {
       proc,
-      parsed: parseGeminiJsonl(proc.stdout),
+      parsed: parseGeminiJsonl(proc.stdout, { plainTextFallback: isAgyCLI }),
     };
   };
 
@@ -596,6 +610,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       attempt.parsed.resultEvent,
       attempt.proc.exitCode,
     );
+    const quotaMeta = detectGeminiQuotaExhausted({
+      parsed: attempt.parsed.resultEvent,
+      stdout: attempt.proc.stdout,
+      stderr: attempt.proc.stderr,
+    });
+    const transientUpstream =
+      failed &&
+      !authMeta.requiresAuth &&
+      !clearSessionForTurnLimit &&
+      quotaMeta.exhausted;
 
     // On retry, don't fall back to old session ID — the old session was stale
     const canFallbackToRuntimeSession = !isRetry;
@@ -621,6 +645,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         stderr: attempt.proc.stderr,
       }),
       ...(failed && clearSessionForTurnLimit ? { stopReason: "max_turns_exhausted" } : {}),
+      ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
     };
 
     return {
@@ -632,7 +657,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? "gemini_auth_required"
         : failed && clearSessionForTurnLimit
         ? "max_turns_exhausted"
+        : transientUpstream
+        ? "gemini_transient_upstream"
         : null,
+      errorFamily: transientUpstream ? "transient_upstream" : null,
       usage: attempt.parsed.usage,
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,

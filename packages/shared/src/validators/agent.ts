@@ -57,9 +57,20 @@ const agentModelProfileConfigSchema = z.object({
   adapterConfig: adapterConfigSchema,
 }).strict();
 
+const agentProviderCascadeEntrySchema = z.object({
+  enabled: z.boolean().optional(),
+  label: z.string().trim().min(1).optional(),
+  adapterType: agentAdapterTypeSchema,
+  adapterConfig: adapterConfigSchema,
+}).strict();
+
 export const agentRuntimeConfigSchema = z.object({
   modelProfiles: z.object({
     cheap: agentModelProfileConfigSchema.optional(),
+  }).strict().optional(),
+  providerCascade: z.object({
+    enabled: z.boolean().optional(),
+    entries: z.array(agentProviderCascadeEntrySchema),
   }).strict().optional(),
 }).catchall(z.unknown());
 

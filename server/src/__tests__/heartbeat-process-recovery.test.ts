@@ -31,7 +31,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { runningProcesses } from "../adapters/index.ts";
+import { getServerAdapter, runningProcesses } from "../adapters/index.ts";
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
 const mockAdapterExecute = vi.hoisted(() =>
@@ -809,7 +809,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows.map((row) => row.blockerIssueId));
   }
 
-  async function seedQueuedIssueRunFixture() {
+  async function seedQueuedIssueRunFixture(input?: {
+    adapterType?: string;
+    adapterConfig?: Record<string, unknown>;
+    runtimeConfig?: Record<string, unknown>;
+    contextSnapshot?: Record<string, unknown>;
+  }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runId = randomUUID();
@@ -831,9 +836,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       name: "CodexCoder",
       role: "engineer",
       status: "idle",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {
+      adapterType: input?.adapterType ?? "codex_local",
+      adapterConfig: input?.adapterConfig ?? {},
+      runtimeConfig: input?.runtimeConfig ?? {
         heartbeat: {
           wakeOnDemand: true,
           maxConcurrentRuns: 1,
@@ -868,6 +873,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         issueId,
         taskId: issueId,
         wakeReason: "issue_assigned",
+        ...(input?.contextSnapshot ?? {}),
       },
       updatedAt: now,
       createdAt: now,
@@ -1229,7 +1235,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       },
     });
 
-    const { agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    const { agentId, runId, issueId } = await seedQueuedIssueRunFixture({
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+        providerCascade: {
+          enabled: false,
+          entries: [],
+        },
+      },
+    });
     const heartbeat = heartbeatService(db);
 
     await heartbeat.resumeQueuedRuns();
@@ -1266,6 +1283,177 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(0);
+  });
+
+  it("cascades a transient provider failure to the next configured adapter with the same issue context", async () => {
+    mockAdapterExecute
+      .mockResolvedValueOnce({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorCode: "adapter_failed",
+        errorFamily: "transient_upstream",
+        retryNotBefore: "2026-03-19T01:00:00.000Z",
+        errorMessage: "Codex usage limit reached.",
+        provider: "openai",
+        model: "gpt-5.4",
+        resultJson: {
+          errorFamily: "transient_upstream",
+          retryNotBefore: "2026-03-19T01:00:00.000Z",
+        },
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        provider: "google",
+        model: "gemini-2.5-pro",
+        summary: "Fallback provider completed the heartbeat.",
+      });
+
+    const { agentId, runId, issueId } = await seedQueuedIssueRunFixture({
+      adapterConfig: { model: "gpt-5.4" },
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+        providerCascade: {
+          enabled: true,
+          entries: [
+            {
+              label: "Gemini fallback",
+              adapterType: "gemini_local",
+              adapterConfig: { model: "gemini-2.5-pro" },
+            },
+          ],
+        },
+      },
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId);
+
+    const scheduledRuns = await waitForValue(async () => {
+      const rows = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      return rows.length >= 2 ? rows : null;
+    });
+    expect(scheduledRuns).toHaveLength(2);
+
+    const retryRun = scheduledRuns?.find((row) => row.id !== runId);
+    expect(retryRun?.status).toBe("scheduled_retry");
+    expect(retryRun?.scheduledRetryReason).toBe("provider_cascade_retry");
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      taskId: issueId,
+      wakeReason: "provider_cascade_retry",
+      providerCascade: {
+        activeIndex: 0,
+        activeAdapterType: "gemini_local",
+        activeLabel: "Gemini fallback",
+        previousRunId: runId,
+        history: [
+          {
+            runId,
+            adapterType: "codex_local",
+            activeIndex: null,
+            errorCode: "adapter_failed",
+            retryNotBefore: "2026-03-19T01:00:00.000Z",
+          },
+        ],
+      },
+    });
+    expect((retryRun?.contextSnapshot as Record<string, unknown> | undefined)?.modelProfile).toBeUndefined();
+
+    const retryDueAt = retryRun?.scheduledRetryAt ? new Date(retryRun.scheduledRetryAt) : new Date();
+    await heartbeat.promoteDueScheduledRetries(new Date(retryDueAt.getTime() + 1_000));
+    await heartbeat.resumeQueuedRuns();
+
+    const completedRetry = await waitForValue(async () => {
+      const row = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, retryRun!.id))
+        .then((rows) => rows[0] ?? null);
+      return row?.status === "succeeded" ? row : null;
+    });
+    expect(completedRetry?.status).toBe("succeeded");
+    expect(completedRetry?.resultJson).toMatchObject({
+      providerCascade: {
+        activeIndex: 0,
+        adapterType: "gemini_local",
+        label: "Gemini fallback",
+        applied: true,
+      },
+    });
+
+    expect(vi.mocked(getServerAdapter).mock.calls.map((call) => call[0])).toEqual(
+      expect.arrayContaining(["codex_local", "gemini_local"]),
+    );
+    expect(mockAdapterExecute.mock.calls[1]?.[0]).toMatchObject({
+      config: { model: "gemini-2.5-pro" },
+      context: { issueId },
+    });
+  });
+
+  it("does not cascade non-quota auth/config failures", async () => {
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "gemini_auth_required",
+      errorMessage: "Gemini authentication required.",
+      provider: "google",
+      model: "gemini-2.5-pro",
+      resultJson: {
+        errorCode: "gemini_auth_required",
+      },
+    });
+
+    const { agentId, runId } = await seedQueuedIssueRunFixture({
+      adapterType: "gemini_local",
+      adapterConfig: { model: "gemini-2.5-pro" },
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+        providerCascade: {
+          enabled: true,
+          entries: [
+            {
+              label: "Codex fallback",
+              adapterType: "codex_local",
+              adapterConfig: { model: "gpt-5.5" },
+            },
+          ],
+        },
+      },
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const originalRun = runs.find((row) => row.id === runId);
+    expect(originalRun?.status).toBe("failed");
+    expect(originalRun?.errorCode).toBe("gemini_auth_required");
+    expect(runs.some((row) => row.scheduledRetryReason === "provider_cascade_retry")).toBe(false);
+
+    const events = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId));
+    expect(events.map((event) => event.message).join("\n")).not.toContain("Provider cascade scheduled");
   });
 
   it("queues one finish-handoff wake when a successful run leaves in-progress work without a next action", async () => {

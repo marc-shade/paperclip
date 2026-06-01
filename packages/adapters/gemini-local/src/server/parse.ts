@@ -75,7 +75,7 @@ function accumulateUsage(
   );
 }
 
-export function parseGeminiJsonl(stdout: string) {
+export function parseGeminiJsonl(stdout: string, opts: { plainTextFallback?: boolean } = {}) {
   let sessionId: string | null = null;
   const messages: string[] = [];
   let errorMessage: string | null = null;
@@ -188,9 +188,14 @@ export function parseGeminiJsonl(stdout: string) {
     }
   }
 
+  const jsonlSummary = messages.join("\n\n").trim();
+  // For CLIs that output plain text (e.g. agy), fall back to raw stdout when no JSONL was parsed.
+  const summary =
+    jsonlSummary || (opts.plainTextFallback && !resultEvent ? stdout.trim() : jsonlSummary);
+
   return {
     sessionId,
-    summary: messages.join("\n\n").trim(),
+    summary,
     usage,
     costUsd,
     errorMessage,

@@ -161,7 +161,7 @@ export async function testEnvironment(
     if (!commandLooksLike(command, "gemini")) {
       checks.push({
         code: "gemini_hello_probe_skipped_custom_command",
-        level: "info",
+        level: "warn",
         message: "Skipped hello probe because command is not `gemini`.",
         detail: command,
         hint: "Use the `gemini` CLI command to run the automatic installation and auth probe.",

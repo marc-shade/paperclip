@@ -51,6 +51,49 @@ In agent runtime settings, configure heartbeat policy:
 - `wakeOnOnDemand`: allow ping-style on-demand wakeups
 - `wakeOnAutomation`: allow system automation wakeups
 
+### 3.2.1 Provider fallback cascade
+
+Agents can define `runtimeConfig.providerCascade` to keep work moving when the
+primary provider is temporarily exhausted. The runtime only enters the cascade
+when an adapter reports a quota, usage-limit, or rate-limit condition through
+the transient upstream error contract. Authentication failures, missing CLIs,
+bad config, checkout conflicts, deterministic test/code failures, and bad agent
+instructions do not cascade.
+
+Example:
+
+```json
+{
+  "providerCascade": {
+    "enabled": true,
+    "entries": [
+      {
+        "label": "Codex GPT-5.5",
+        "adapterType": "codex_local",
+        "adapterConfig": { "model": "gpt-5.5" }
+      },
+      {
+        "label": "Gemini Pro preview",
+        "adapterType": "gemini_local",
+        "adapterConfig": { "model": "gemini-3.1-pro-preview" }
+      }
+    ]
+  }
+}
+```
+
+If `providerCascade` is omitted, Paperclip uses the company-default order for
+the agent's primary adapter: Claude agents try Codex then Gemini; Codex agents
+try Gemini then Claude; Gemini agents try Codex then Claude; other local agent
+adapters try Codex, Gemini, then Claude. Set `"enabled": false` to opt out for
+an agent.
+
+Each fallback heartbeat preserves the issue context, run audit chain, checkout
+lock, execution workspace, injected skills, and Paperclip environment. Run
+events and run result metadata record the selected fallback adapter/model and
+the source failure. When all configured candidates are exhausted, the runtime
+stops the cascade and leaves a terminal failed run instead of looping.
+
 ## 3.3 Working directory and execution limits
 
 For local adapters, set:

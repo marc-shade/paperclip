@@ -166,6 +166,13 @@ interface ModelProfileSummary {
   fallbackReason: string | null;
 }
 
+interface ProviderCascadeSummary {
+  adapterType: string;
+  label: string | null;
+  applied: boolean;
+  fallbackReason: string | null;
+}
+
 function modelProfileForRun(run: RunForIssue): ModelProfileSummary | null {
   const result = asRecord(run.resultJson);
   const profile = asRecord(result?.modelProfile);
@@ -194,6 +201,37 @@ function modelProfileTitle(summary: ModelProfileSummary) {
   const lines = [`Requested: ${summary.requested}`];
   if (summary.applied) lines.push(`Applied: ${summary.applied}`);
   if (summary.configSource) lines.push(`Source: ${summary.configSource}`);
+  if (summary.fallbackReason) lines.push(`Fallback: ${summary.fallbackReason}`);
+  return lines.join("\n");
+}
+
+function providerCascadeForRun(run: RunForIssue): ProviderCascadeSummary | null {
+  const result = asRecord(run.resultJson);
+  const cascade = asRecord(result?.providerCascade);
+  if (!cascade) return null;
+  const adapterType = readString(cascade.adapterType);
+  if (!adapterType) return null;
+  return {
+    adapterType,
+    label: readString(cascade.label),
+    applied: cascade.applied === true,
+    fallbackReason: readString(cascade.fallbackReason),
+  };
+}
+
+function providerCascadeBadgeTone(summary: ProviderCascadeSummary) {
+  if (summary.applied) {
+    return "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300";
+  }
+  if (summary.fallbackReason) {
+    return "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300";
+  }
+  return "border-border bg-background text-muted-foreground";
+}
+
+function providerCascadeTitle(summary: ProviderCascadeSummary) {
+  const lines = [`Adapter: ${summary.adapterType}`];
+  if (summary.label) lines.push(`Label: ${summary.label}`);
   if (summary.fallbackReason) lines.push(`Fallback: ${summary.fallbackReason}`);
   return lines.join("\n");
 }
@@ -773,6 +811,24 @@ export function IssueRunLedgerContent({
                       </span>
                     );
                   })()}
+                  {(() => {
+                    const cascade = providerCascadeForRun(run);
+                    if (!cascade) return null;
+                    const label = cascade.applied
+                      ? `Fallback: ${cascade.label ?? cascade.adapterType}`
+                      : `Fallback unavailable: ${cascade.adapterType}`;
+                    return (
+                      <span
+                        className={cn(
+                          "rounded-md border px-1.5 py-0.5 text-[11px] font-medium",
+                          providerCascadeBadgeTone(cascade),
+                        )}
+                        title={providerCascadeTitle(cascade)}
+                      >
+                        {label}
+                      </span>
+                    );
+                  })()}
                   <span className="ml-auto shrink-0">{relativeTime(item.timestamp)}</span>
                 </div>
 
@@ -819,6 +875,17 @@ export function IssueRunLedgerContent({
                         : `${profile.requested} profile unavailable`}
                       {": "}
                       <span className="font-mono">{profile.fallbackReason}</span>
+                    </p>
+                  );
+                })()}
+
+                {(() => {
+                  const cascade = providerCascadeForRun(run);
+                  if (!cascade?.fallbackReason || cascade.applied) return null;
+                  return (
+                    <p className="min-w-0 break-words text-[11px] leading-5 text-amber-700 dark:text-amber-300">
+                      Provider fallback unavailable:{" "}
+                      <span className="font-mono">{cascade.fallbackReason}</span>
                     </p>
                   );
                 })()}

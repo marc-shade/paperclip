@@ -20,6 +20,7 @@ export type RunRetryStateSummary = {
 
 const RETRY_REASON_LABELS: Record<string, string> = {
   transient_failure: "Transient failure",
+  provider_cascade_retry: "Provider fallback",
   missing_issue_comment: "Missing issue comment",
   process_lost: "Process lost",
   assignment_recovery: "Assignment recovery",

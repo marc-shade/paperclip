@@ -20,8 +20,21 @@ export interface AgentModelProfileConfig {
   adapterConfig: Record<string, unknown>;
 }
 
+export interface AgentProviderCascadeEntry {
+  enabled?: boolean;
+  label?: string;
+  adapterType: AgentAdapterType;
+  adapterConfig: Record<string, unknown>;
+}
+
+export interface AgentProviderCascadeConfig {
+  enabled?: boolean;
+  entries: AgentProviderCascadeEntry[];
+}
+
 export interface AgentRuntimeConfig extends Record<string, unknown> {
   modelProfiles?: Partial<Record<ModelProfileKey, AgentModelProfileConfig>>;
+  providerCascade?: AgentProviderCascadeConfig;
 }
 
 export type AgentInstructionsBundleMode = "managed" | "external";

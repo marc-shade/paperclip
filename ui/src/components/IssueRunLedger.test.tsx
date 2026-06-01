@@ -505,6 +505,43 @@ describe("IssueRunLedger", () => {
     expect(container.textContent).toContain("agent_runtime_profile_disabled");
   });
 
+  it("renders provider cascade fallback metadata", () => {
+    renderLedger({
+      runs: [
+        createRun({
+          runId: "run-provider-fallback",
+          resultJson: {
+            providerCascade: {
+              activeIndex: 0,
+              adapterType: "gemini_local",
+              label: "Gemini fallback",
+              applied: true,
+              fallbackReason: null,
+            },
+          },
+        }),
+        createRun({
+          runId: "run-provider-fallback-missing",
+          createdAt: "2026-04-18T19:51:00.000Z",
+          resultJson: {
+            providerCascade: {
+              activeIndex: 1,
+              adapterType: "claude_local",
+              label: "Claude fallback",
+              applied: false,
+              fallbackReason: "provider_cascade_entry_not_configured",
+            },
+          },
+        }),
+      ],
+    });
+
+    expect(container.textContent).toContain("Fallback: Gemini fallback");
+    expect(container.textContent).toContain("Fallback unavailable: claude_local");
+    expect(container.textContent).toContain("Provider fallback unavailable");
+    expect(container.textContent).toContain("provider_cascade_entry_not_configured");
+  });
+
   it("hides watchdog decision actions for known non-owner viewers", () => {
     const onWatchdogDecision = vi.fn();
     renderLedger({

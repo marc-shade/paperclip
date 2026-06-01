@@ -31,6 +31,8 @@ PATCH /api/issues/{issueId}
 
 The same `executionWorkspaceSettings.environmentId` field is accepted on `POST /api/companies/{companyId}/issues`. Leave it unset to inherit the default (or the parent's environment for child issues). Selection is validated server-side and returns `422 Unprocessable` if the environment is missing, belongs to another company, is `archived`, uses a driver not allowed in this context, or is the built-in probe-only `fake` sandbox provider.
 
+Environment pins only take effect when the instance experimental setting `enableIsolatedWorkspaces` is enabled. If that setting is disabled, the issue service drops `executionWorkspaceSettings` on create/update and issue readback will show `executionWorkspaceSettings: null`. In that case, route work by explicit operator instruction (for example `ssh user@host`) or ask a board/admin to enable isolated workspaces before relying on environment pinning.
+
 Discover what you can pin to (any agent with company access can read these):
 
 ```sh

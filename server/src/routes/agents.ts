@@ -919,8 +919,46 @@ export function agentRoutes(
     return entries;
   }
 
+  function listRuntimeProviderCascadeAdapterConfigs(runtimeConfig: unknown): Array<{
+    entryIndex: number;
+    entry: Record<string, unknown>;
+    adapterType: string;
+    adapterConfig: Record<string, unknown>;
+    path: string;
+  }> {
+    const runtimeRecord = asRecord(runtimeConfig);
+    const providerCascade = asRecord(runtimeRecord?.providerCascade);
+    const rawEntries = Array.isArray(providerCascade?.entries) ? providerCascade.entries : [];
+    const entries: Array<{
+      entryIndex: number;
+      entry: Record<string, unknown>;
+      adapterType: string;
+      adapterConfig: Record<string, unknown>;
+      path: string;
+    }> = [];
+
+    rawEntries.forEach((rawEntry, entryIndex) => {
+      const entry = asRecord(rawEntry);
+      const adapterConfig = asRecord(entry?.adapterConfig);
+      const adapterType = asNonEmptyString(entry?.adapterType);
+      if (!entry || !adapterConfig || !adapterType) return;
+      entries.push({
+        entryIndex,
+        entry,
+        adapterType,
+        adapterConfig,
+        path: `runtimeConfig.providerCascade.entries.${entryIndex}.adapterConfig`,
+      });
+    });
+
+    return entries;
+  }
+
   function assertNoAgentRuntimeConfigAdapterConfigMutation(req: Request, runtimeConfig: unknown) {
     for (const entry of listRuntimeModelProfileAdapterConfigs(runtimeConfig)) {
+      assertNoAgentAdapterConfigMutation(req, entry.adapterConfig, entry.path);
+    }
+    for (const entry of listRuntimeProviderCascadeAdapterConfigs(runtimeConfig)) {
       assertNoAgentAdapterConfigMutation(req, entry.adapterConfig, entry.path);
     }
   }
@@ -951,31 +989,61 @@ export function agentRoutes(
     runtimeConfig: Record<string, unknown>,
     baseAdapterConfig: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    const entries = listRuntimeModelProfileAdapterConfigs(runtimeConfig);
-    if (entries.length === 0) return runtimeConfig;
+    const profileEntries = listRuntimeModelProfileAdapterConfigs(runtimeConfig);
+    const cascadeEntries = listRuntimeProviderCascadeAdapterConfigs(runtimeConfig);
+    if (profileEntries.length === 0 && cascadeEntries.length === 0) return runtimeConfig;
     const adapterModelProfiles = await listAdapterModelProfiles(adapterType);
 
     const normalizedRuntimeConfig = { ...runtimeConfig };
-    const modelProfiles = asRecord(runtimeConfig.modelProfiles) ?? {};
-    const normalizedModelProfiles = { ...modelProfiles };
-    normalizedRuntimeConfig.modelProfiles = normalizedModelProfiles;
+    if (profileEntries.length > 0) {
+      const modelProfiles = asRecord(runtimeConfig.modelProfiles) ?? {};
+      const normalizedModelProfiles = { ...modelProfiles };
+      normalizedRuntimeConfig.modelProfiles = normalizedModelProfiles;
 
-    for (const entry of entries) {
-      const adapterProfile = adapterModelProfiles.find((profile) => profile.key === entry.profileKey);
-      const adapterDefaultConfig = asRecord(adapterProfile?.adapterConfig) ?? {};
-      const normalizedAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
-        companyId,
-        adapterType,
-        adapterConfig: entry.adapterConfig,
-        constraintAdapterConfig: {
-          ...baseAdapterConfig,
-          ...adapterDefaultConfig,
-        },
-      });
-      normalizedModelProfiles[entry.profileKey] = {
-        ...entry.profile,
-        adapterConfig: normalizedAdapterConfig,
+      for (const entry of profileEntries) {
+        const adapterProfile = adapterModelProfiles.find((profile) => profile.key === entry.profileKey);
+        const adapterDefaultConfig = asRecord(adapterProfile?.adapterConfig) ?? {};
+        const normalizedAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
+          companyId,
+          adapterType,
+          adapterConfig: entry.adapterConfig,
+          constraintAdapterConfig: {
+            ...baseAdapterConfig,
+            ...adapterDefaultConfig,
+          },
+        });
+        normalizedModelProfiles[entry.profileKey] = {
+          ...entry.profile,
+          adapterConfig: normalizedAdapterConfig,
+        };
+      }
+    }
+
+    if (cascadeEntries.length > 0) {
+      const providerCascade = asRecord(runtimeConfig.providerCascade) ?? {};
+      const rawEntries = Array.isArray(providerCascade.entries) ? providerCascade.entries : [];
+      const normalizedEntries = [...rawEntries];
+      normalizedRuntimeConfig.providerCascade = {
+        ...providerCascade,
+        entries: normalizedEntries,
       };
+
+      for (const entry of cascadeEntries) {
+        const normalizedAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
+          companyId,
+          adapterType: entry.adapterType,
+          adapterConfig: applyCreateDefaultsByAdapterType(entry.adapterType, entry.adapterConfig),
+          constraintAdapterConfig: {
+            ...baseAdapterConfig,
+            ...applyCreateDefaultsByAdapterType(entry.adapterType, entry.adapterConfig),
+          },
+        });
+        normalizedEntries[entry.entryIndex] = {
+          ...entry.entry,
+          adapterType: entry.adapterType,
+          adapterConfig: normalizedAdapterConfig,
+        };
+      }
     }
 
     return normalizedRuntimeConfig;

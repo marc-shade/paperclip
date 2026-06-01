@@ -192,6 +192,78 @@ describe("buildAgentUpdatePatch", () => {
     });
   });
 
+  it("composes full runtime config edits with heartbeat and model profile overlays", () => {
+    const agent = makeAgent();
+    agent.runtimeConfig = {
+      heartbeat: { enabled: true, intervalSec: 300 },
+      providerCascade: {
+        enabled: true,
+        entries: [{ adapterType: "codex_local", adapterConfig: { model: "old" } }],
+      },
+      modelProfiles: {
+        cheap: {
+          enabled: true,
+          adapterConfig: { model: "old-cheap" },
+        },
+      },
+    };
+
+    const patch = buildAgentUpdatePatch(
+      agent,
+      makeOverlay({
+        runtime: {
+          runtimeConfig: {
+            heartbeat: { enabled: true, intervalSec: 300 },
+            providerCascade: {
+              enabled: true,
+              entries: [{ adapterType: "gemini_local", adapterConfig: { model: "gemini-2.5-pro" } }],
+            },
+            modelProfiles: {
+              cheap: {
+                enabled: true,
+                adapterConfig: { model: "old-cheap" },
+              },
+            },
+          },
+        },
+        heartbeat: {
+          maxTurnContinuation: {
+            enabled: true,
+            maxAttempts: 3,
+            delayMs: 1000,
+          },
+        },
+        modelProfiles: {
+          cheap: {
+            enabled: false,
+          },
+        },
+      }),
+    );
+
+    expect(patch.runtimeConfig).toEqual({
+      heartbeat: {
+        enabled: true,
+        intervalSec: 300,
+        maxTurnContinuation: {
+          enabled: true,
+          maxAttempts: 3,
+          delayMs: 1000,
+        },
+      },
+      providerCascade: {
+        enabled: true,
+        entries: [{ adapterType: "gemini_local", adapterConfig: { model: "gemini-2.5-pro" } }],
+      },
+      modelProfiles: {
+        cheap: {
+          enabled: false,
+          adapterConfig: { model: "old-cheap" },
+        },
+      },
+    });
+  });
+
   it("preserves adapter-agnostic keys when changing adapter types", () => {
     const patch = buildAgentUpdatePatch(
       makeAgent(),
