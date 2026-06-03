@@ -1249,6 +1249,23 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(activityRows.map((row) => row.action)).toEqual(
       expect.arrayContaining(["issue.recovery_action_resolved"]),
     );
+
+    // The partial unique index issue_recovery_actions_active_source_uq only
+    // covers active/escalated rows, so reaping the stale action must free the
+    // lock: a fresh recovery can now be created for the same source issue.
+    const reborn = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "missing-disposition:after-reap",
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    expect(reborn.id).not.toBe(terminalAction.id);
+    expect(reborn.status).toBe("active");
   });
 
   it("reaps recovery actions that passed their timeoutAt even on a live source issue", async () => {
