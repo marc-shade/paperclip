@@ -764,4 +764,110 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
   });
+
+  it("reaps active recovery actions whose source issue is terminal, leaving live ones untouched", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const terminalAction = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "missing-disposition:terminal",
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    // A second source issue that stays live must keep its active recovery action.
+    const liveSourceIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: liveSourceIssueId,
+      companyId,
+      title: "Still in progress",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: managerId,
+      issueNumber: 99,
+      identifier: "LIVE-99",
+    });
+    const liveAction = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId: liveSourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "stranded:live",
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    // Source issue reaches a terminal state with no path that resolves the action.
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, sourceIssueId));
+
+    const result = await recovery.reapResolvableRecoveryActions();
+
+    expect(result.terminalResolved).toBe(1);
+    expect(result.timedOutResolved).toBe(0);
+    expect(result.resolved).toBe(1);
+
+    const [terminalRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, terminalAction.id));
+    expect(terminalRow).toMatchObject({ status: "resolved", outcome: "restored" });
+    expect(terminalRow?.resolvedAt).toBeTruthy();
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+
+    const [liveRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, liveAction.id));
+    expect(liveRow?.status).toBe("active");
+
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    expect(activityRows.map((row) => row.action)).toEqual(
+      expect.arrayContaining(["issue.recovery_action_resolved"]),
+    );
+  });
+
+  it("reaps recovery actions that passed their timeoutAt even on a live source issue", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "stranded:timeout",
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    await db
+      .update(issueRecoveryActions)
+      .set({ timeoutAt: new Date("2020-01-01T00:00:00.000Z") })
+      .where(eq(issueRecoveryActions.id, action.id));
+
+    const result = await recovery.reapResolvableRecoveryActions();
+
+    expect(result.timedOutResolved).toBe(1);
+    expect(result.terminalResolved).toBe(0);
+    const [row] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(row).toMatchObject({ status: "resolved", outcome: "restored" });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
 });

@@ -1,6 +1,6 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, exists, inArray, isNotNull, lte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueRecoveryActions } from "@paperclipai/db";
+import { issueRecoveryActions, issues } from "@paperclipai/db";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
@@ -10,7 +10,28 @@ import type {
 } from "@paperclipai/shared";
 
 const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
+const TERMINAL_SOURCE_ISSUE_STATUSES = ["done", "cancelled"] as const;
 const MAX_UPSERT_RETRIES = 3;
+
+export const TERMINAL_SOURCE_REAP_NOTE =
+  "Auto-resolved by recovery reaper: source issue reached a terminal state (done/cancelled), so the recovery action no longer has anything to recover.";
+export const TIMED_OUT_REAP_NOTE =
+  "Auto-resolved by recovery reaper: recovery action passed its timeoutAt without resolution.";
+
+export type ReapedRecoveryAction = {
+  id: string;
+  companyId: string;
+  sourceIssueId: string;
+  kind: IssueRecoveryActionKind;
+  reason: "terminal_source_issue" | "timed_out";
+};
+
+export type ReapResolvableActionsResult = {
+  terminalResolved: number;
+  timedOutResolved: number;
+  resolved: number;
+  reaped: ReapedRecoveryAction[];
+};
 
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -286,10 +307,103 @@ export function issueRecoveryActionService(db: Db) {
     return updated ? toReadModel(updated) : null;
   }
 
+  // Closes recovery actions that can never make progress: the source issue is
+  // already terminal (done/cancelled), or the action passed an explicit
+  // timeoutAt. Without this, a finished/cancelled issue keeps its active
+  // recovery action forever — holding the partial unique constraint on the
+  // source issue and keeping its owner agent on the hook for wake noise.
+  async function reapResolvableActions(
+    opts?: { now?: Date },
+    dbOrTx: DbOrTransaction = db,
+  ): Promise<ReapResolvableActionsResult> {
+    const now = opts?.now ?? new Date();
+
+    const terminalRows = await dbOrTx
+      .update(issueRecoveryActions)
+      .set({
+        status: "resolved",
+        outcome: "restored",
+        resolutionNote: TERMINAL_SOURCE_REAP_NOTE,
+        resolvedAt: now,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+          exists(
+            dbOrTx
+              .select({ one: sql`1` })
+              .from(issues)
+              .where(
+                and(
+                  eq(issues.id, issueRecoveryActions.sourceIssueId),
+                  eq(issues.companyId, issueRecoveryActions.companyId),
+                  inArray(issues.status, [...TERMINAL_SOURCE_ISSUE_STATUSES]),
+                ),
+              ),
+          ),
+        ),
+      )
+      .returning({
+        id: issueRecoveryActions.id,
+        companyId: issueRecoveryActions.companyId,
+        sourceIssueId: issueRecoveryActions.sourceIssueId,
+        kind: issueRecoveryActions.kind,
+      });
+
+    const timedOutRows = await dbOrTx
+      .update(issueRecoveryActions)
+      .set({
+        status: "resolved",
+        outcome: "restored",
+        resolutionNote: TIMED_OUT_REAP_NOTE,
+        resolvedAt: now,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+          isNotNull(issueRecoveryActions.timeoutAt),
+          lte(issueRecoveryActions.timeoutAt, now),
+        ),
+      )
+      .returning({
+        id: issueRecoveryActions.id,
+        companyId: issueRecoveryActions.companyId,
+        sourceIssueId: issueRecoveryActions.sourceIssueId,
+        kind: issueRecoveryActions.kind,
+      });
+
+    const reaped: ReapedRecoveryAction[] = [
+      ...terminalRows.map((row) => ({
+        id: row.id,
+        companyId: row.companyId,
+        sourceIssueId: row.sourceIssueId,
+        kind: row.kind as IssueRecoveryActionKind,
+        reason: "terminal_source_issue" as const,
+      })),
+      ...timedOutRows.map((row) => ({
+        id: row.id,
+        companyId: row.companyId,
+        sourceIssueId: row.sourceIssueId,
+        kind: row.kind as IssueRecoveryActionKind,
+        reason: "timed_out" as const,
+      })),
+    ];
+
+    return {
+      terminalResolved: terminalRows.length,
+      timedOutResolved: timedOutRows.length,
+      resolved: reaped.length,
+      reaped,
+    };
+  }
+
   return {
     getActiveForIssue,
     listActiveForIssues,
     resolveActiveForIssue,
+    reapResolvableActions,
     upsertSourceScoped,
   };
 }
