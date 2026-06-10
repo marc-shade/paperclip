@@ -1995,8 +1995,12 @@ function deriveTaskKey(
 
 /**
  * Extended task key derivation that falls back to a stable synthetic key
- * for timer/heartbeat wakes. This ensures timer wakes can resume their
- * previous session via `agentTaskSessions` instead of starting fresh.
+ * for timer/heartbeat wakes. The synthetic key keeps the
+ * `agentTaskSessions` row addressable across heartbeats so the row can be
+ * cleared and re-keyed deterministically; it does NOT mean the prior
+ * session is resumed. Since PF-4 (#4838), `heartbeat_timer` wakes always
+ * go through `shouldResetTaskSessionForWake` and start a fresh session —
+ * see `describeSessionResetReason` for the paired log message.
  *
  * The synthetic key is only used when:
  * - No explicit task/issue key exists in the context
@@ -2025,7 +2029,14 @@ export function shouldResetTaskSessionForWake(
     wakeReason === "issue_assigned" ||
     wakeReason === "execution_review_requested" ||
     wakeReason === "execution_approval_requested" ||
-    wakeReason === "execution_changes_requested"
+    wakeReason === "execution_changes_requested" ||
+    // PF-4: timer-driven wakes are exploratory ("any new work?"). They do not
+    // carry meaningful continuation state, so reusing the prior task session
+    // for repeated timer wakes accumulates low-value context and pushes the
+    // session toward the 64k compaction threshold (observed in CEO run
+    // 292a5fd1, where timer wakes repeatedly bloated a long-lived manager
+    // session). Reset on every timer wake so each interval starts fresh.
+    wakeReason === "heartbeat_timer"
   ) {
     return true;
   }
@@ -2090,7 +2101,7 @@ export function formatRuntimeWorkspaceWarningLog(warning: string) {
   };
 }
 
-function describeSessionResetReason(
+export function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
   if (contextSnapshot?.forceFreshSession === true) return "forceFreshSession was requested";
@@ -2100,7 +2111,67 @@ function describeSessionResetReason(
   if (wakeReason === "execution_review_requested") return "wake reason is execution_review_requested";
   if (wakeReason === "execution_approval_requested") return "wake reason is execution_approval_requested";
   if (wakeReason === "execution_changes_requested") return "wake reason is execution_changes_requested";
+  // PF-4: paired with shouldResetTaskSessionForWake — keep the reason wording
+  // explicit so run logs make session reuse/reset behavior legible.
+  if (wakeReason === "heartbeat_timer") return "wake reason is heartbeat_timer (timer-driven wake starts fresh)";
   return null;
+}
+
+export function shouldDeferFollowupWakeForSameIssue(input: {
+  activeRunStatus: string | null | undefined;
+  isSameExecutionAgent: boolean;
+  wakeCommentId: string | null | undefined;
+  forceFreshSession: boolean;
+}) {
+  // A comment follow-up or explicit fresh-session wake needs a new run boundary.
+  if (!input.isSameExecutionAgent) return false;
+  if (input.activeRunStatus !== "running") return false;
+  if (input.wakeCommentId) return true;
+  if (input.forceFreshSession) return true;
+  return false;
+}
+
+const SESSION_CONFIGURED_MODEL_KEY = "__paperclipConfiguredModel";
+
+function readConfiguredModelFromAdapterConfig(
+  adapterConfig: Record<string, unknown> | null | undefined,
+) {
+  return readNonEmptyString(adapterConfig?.model);
+}
+
+function attachConfiguredModelToSessionParams(
+  sessionParams: Record<string, unknown> | null | undefined,
+  configuredModel: string | null,
+) {
+  if (!configuredModel) return sessionParams ?? null;
+  const next = { ...(sessionParams ?? {}) };
+  next[SESSION_CONFIGURED_MODEL_KEY] = configuredModel;
+  return next;
+}
+
+function readConfiguredModelFromSessionParams(
+  sessionParams: Record<string, unknown> | null | undefined,
+) {
+  return readNonEmptyString(sessionParams?.[SESSION_CONFIGURED_MODEL_KEY]);
+}
+
+export function shouldResetTaskSessionForModelChange(input: {
+  configuredModel: string | null;
+  taskSessionParams: Record<string, unknown> | null | undefined;
+}) {
+  const { configuredModel, taskSessionParams } = input;
+  if (!configuredModel || !taskSessionParams) return false;
+  const sessionModel = readConfiguredModelFromSessionParams(taskSessionParams);
+  return !!sessionModel && sessionModel !== configuredModel;
+}
+
+export function stripConfiguredModelFromSessionParams(
+  sessionParams: Record<string, unknown> | null | undefined,
+) {
+  if (!sessionParams) return null;
+  const next = { ...sessionParams };
+  delete next[SESSION_CONFIGURED_MODEL_KEY];
+  return next;
 }
 
 function shouldAutoCheckoutIssueForWake(input: {
@@ -2352,6 +2423,9 @@ export function mergeCoalescedContextSnapshot(
     ...existing,
     ...incoming,
   };
+  if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
+    merged.forceFreshSession = true;
+  }
   const mergedCommentIds = mergeWakeCommentIds(existing, incoming);
   if (mergedCommentIds.length > 0) {
     const latestCommentId = mergedCommentIds[mergedCommentIds.length - 1];
@@ -2815,7 +2889,7 @@ function getAdapterSessionCodec(adapterType: string) {
   return adapter.sessionCodec ?? defaultSessionCodec;
 }
 
-function normalizeSessionParams(params: Record<string, unknown> | null | undefined) {
+export function normalizeSessionParams(params: Record<string, unknown> | null | undefined) {
   if (!params) return null;
   return Object.keys(params).length > 0 ? params : null;
 }
@@ -5508,6 +5582,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await tx
           .update(issues)
           .set({
+            checkoutRunId: null,
             executionRunId: retryRun.id,
             executionAgentNameKey: normalizeAgentNameKey(agent.name),
             executionLockedAt: now,
@@ -7448,6 +7523,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reapResolvableRecoveryActions(opts);
   }
 
+  async function sweepStaleIssueLocks() {
+    return recovery.sweepStaleIssueLocks();
+  }
+
   function issueIdFromRunContext(contextSnapshot: unknown) {
     const context = parseObject(contextSnapshot);
     return readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
@@ -7801,11 +7880,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         : null,
     });
+    const config = parseObject(agent.adapterConfig);
+    const configuredModel = readConfiguredModelFromAdapterConfig(config);
     const taskSession = taskKey
       ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey)
       : null;
-    const resetTaskSession = shouldResetTaskSessionForWake(context);
-    const sessionResetReason = describeSessionResetReason(context);
+    const taskSessionDecodedParams = normalizeSessionParams(
+      sessionCodec.deserialize(taskSession?.sessionParamsJson ?? null),
+    );
+    const modelChangedSinceTaskSession = shouldResetTaskSessionForModelChange({
+      configuredModel,
+      taskSessionParams: taskSessionDecodedParams,
+    });
+    const resetTaskSession = shouldResetTaskSessionForWake(context) || modelChangedSinceTaskSession;
+    const wakeSessionResetReason = describeSessionResetReason(context);
+    const taskSessionConfiguredModel = readConfiguredModelFromSessionParams(taskSessionDecodedParams);
+    const modelSessionResetReason = modelChangedSinceTaskSession && taskSessionConfiguredModel
+      ? `configured model changed from "${taskSessionConfiguredModel}" to "${configuredModel}"`
+      : null;
+    const sessionResetReason = [modelSessionResetReason, wakeSessionResetReason]
+      .filter((value): value is string => Boolean(value))
+      .join("; ") || null;
     const taskSessionForRun = resetTaskSession ? null : taskSession;
     const explicitResumeSessionParams = normalizeResumeParamsForAdapter(
       agent.adapterType,
@@ -7823,9 +7918,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null) ??
       normalizeResumeParamsForAdapter(
         agent.adapterType,
-        sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? null),
+        stripConfiguredModelFromSessionParams(
+          sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? null),
+        ),
       );
-    const config = parseObject(agent.adapterConfig);
     const resolvedExecutionWorkspaceMode = resolveExecutionWorkspaceMode({
       projectPolicy: projectExecutionWorkspacePolicy,
       issueSettings: issueExecutionWorkspaceSettings,
@@ -8458,7 +8554,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : runtimeSessionDisplayId;
     let runtimeSessionIdForAdapter =
       readNonEmptyString(runtimeSessionParams?.sessionId) ?? runtimeSessionFallback;
-    let runtimeSessionParamsForAdapter = runtimeSessionParams;
+    let runtimeSessionParamsForAdapter = normalizeSessionParams(
+      stripConfiguredModelFromSessionParams(runtimeSessionParams),
+    );
 
     const sessionCompaction = await evaluateSessionCompaction({
       agent,
@@ -9127,7 +9225,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               agentId: agent.id,
               adapterType: agent.adapterType,
               taskKey,
-              sessionParamsJson: nextSessionState.params,
+              sessionParamsJson: attachConfiguredModelToSessionParams(nextSessionState.params, configuredModel),
               sessionDisplayId: nextSessionState.displayId,
               lastRunId: finalizedRun.id,
               lastError: outcome === "succeeded" ? null : (adapterResult.errorMessage ?? "run_failed"),
@@ -9210,7 +9308,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             agentId: agent.id,
             adapterType: agent.adapterType,
             taskKey,
-            sessionParamsJson: previousSessionParams,
+            sessionParamsJson: attachConfiguredModelToSessionParams(previousSessionParams, configuredModel),
             sessionDisplayId: previousSessionDisplayId,
             lastRunId: failedRun.id,
             lastError: message,
@@ -9228,11 +9326,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const setupFailureAgent = await getAgent(run.agentId).catch(() => null);
           await setRunStatus(runId, "failed", {
             error: message,
-            errorCode: "adapter_failed",
+            errorCode: "setup_failed",
             finishedAt: new Date(),
             ...(setupFailureAgent ? {
               resultJson: mergeRunStopMetadataForAgent(setupFailureAgent, "failed", {
-                errorCode: "adapter_failed",
+                errorCode: "setup_failed",
                 errorMessage: message,
               }),
             } : {}),
@@ -9350,16 +9448,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (!issue) return null;
       if (issue.executionRunId && issue.executionRunId !== run.id) return null;
 
-      if (issue.executionRunId === run.id) {
+      // Clear lock columns that point at the terminating run. checkoutRunId is
+      // cleared here in addition to executionRunId so the issue self-heals even
+      // if its assignee or status changed between checkout and termination —
+      // adoptStaleCheckoutRun's narrow WHERE clause cannot cover those paths.
+      if (issue.executionRunId === run.id || issue.checkoutRunId === run.id) {
         await tx
           .update(issues)
           .set({
+            checkoutRunId: null,
             executionRunId: null,
             executionAgentNameKey: null,
             executionLockedAt: null,
             updatedAt: new Date(),
           })
-          .where(eq(issues.id, issue.id));
+          .where(
+            and(
+              eq(issues.id, issue.id),
+              or(eq(issues.executionRunId, run.id), eq(issues.checkoutRunId, run.id)),
+            ),
+          );
       }
 
       if (
@@ -10228,12 +10336,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             normalizeAgentNameKey(executionAgent?.name);
           const isSameExecutionAgent =
             Boolean(executionAgentNameKey) && executionAgentNameKey === agentNameKey;
+          const shouldDeferFollowupWake = shouldDeferFollowupWakeForSameIssue({
+            activeRunStatus: activeExecutionRun.status,
+            isSameExecutionAgent,
+            wakeCommentId,
+            forceFreshSession: enrichedContextSnapshot.forceFreshSession === true,
+          });
           const shouldQueueFollowupForRunningWake =
             shouldQueueFollowupForRunningIssueWake({ contextSnapshot: enrichedContextSnapshot, wakeCommentId }) &&
             activeExecutionRun.status === "running" &&
             isSameExecutionAgent;
 
-          if (isSameExecutionAgent && !shouldQueueFollowupForRunningWake) {
+          if (isSameExecutionAgent && !shouldDeferFollowupWake && !shouldQueueFollowupForRunningWake) {
             const mergedContextSnapshot = mergeCoalescedContextSnapshot(
               activeExecutionRun.contextSnapshot,
               enrichedContextSnapshot,
@@ -10616,41 +10730,58 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return wakeupIds.length;
   }
 
-  async function cancelRunInternal(runId: string, reason = "Cancelled by control plane") {
+  type CancelRunOptions = {
+    errorCode?: string;
+    resultJson?: Record<string, unknown>;
+    eventMessage?: string;
+    eventPayload?: Record<string, unknown>;
+  };
+
+  async function cancelRunInternal(runId: string, reason = "Cancelled by control plane", options: CancelRunOptions = {}) {
     const run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
     if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) return run;
     const agent = await getAgent(run.agentId);
+    const errorCode = options.errorCode ?? "cancelled";
+    const resultJson = agent
+      ? {
+          ...mergeRunStopMetadataForAgent(agent, "cancelled", {
+            resultJson: parseObject(run.resultJson),
+            errorCode,
+            errorMessage: reason,
+          }),
+          ...(options.resultJson ?? {}),
+        }
+      : options.resultJson;
 
     const running = runningProcesses.get(run.id);
-    if (running) {
-      await terminateHeartbeatRunProcess({
-        pid: running.child.pid ?? run.processPid,
-        processGroupId: running.processGroupId ?? run.processGroupId,
-        graceMs: Math.max(1, running.graceSec) * 1000,
-      });
-    } else if (run.processPid || run.processGroupId) {
-      await terminateHeartbeatRunProcess({
-        pid: run.processPid,
-        processGroupId: run.processGroupId,
-      });
+    try {
+      if (running) {
+        await terminateHeartbeatRunProcess({
+          pid: running.child.pid ?? run.processPid,
+          processGroupId: running.processGroupId ?? run.processGroupId,
+          graceMs: Math.max(1, running.graceSec) * 1000,
+        });
+      } else if (run.processPid || run.processGroupId) {
+        await terminateHeartbeatRunProcess({
+          pid: run.processPid,
+          processGroupId: run.processGroupId,
+        });
+      }
+    } finally {
+      runningProcesses.delete(run.id);
     }
 
+    const finishedAt = new Date();
     const cancelled = await setRunStatus(run.id, "cancelled", {
-      finishedAt: new Date(),
+      finishedAt,
       error: reason,
-      errorCode: "cancelled",
-      ...(agent ? {
-        resultJson: mergeRunStopMetadataForAgent(agent, "cancelled", {
-          resultJson: parseObject(run.resultJson),
-          errorCode: "cancelled",
-          errorMessage: reason,
-        }),
-      } : {}),
+      errorCode,
+      ...(resultJson ? { resultJson } : {}),
     });
 
     await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-      finishedAt: new Date(),
+      finishedAt,
       error: reason,
     });
 
@@ -10659,12 +10790,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message: "run cancelled",
+        message: options.eventMessage ?? "run cancelled",
+        ...(options.eventPayload ? { payload: options.eventPayload } : {}),
       });
       await releaseIssueExecutionAndPromote(cancelled);
     }
 
-    runningProcesses.delete(run.id);
     await finalizeAgentStatus(run.agentId, "cancelled");
     await startNextQueuedRunForAgent(run.agentId);
     return cancelled;
@@ -11048,6 +11179,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileStrandedAssignedIssues,
     reapResolvableRecoveryActions,
 
+    sweepStaleIssueLocks,
+
     buildIssueGraphLivenessAutoRecoveryPreview,
 
     reconcileIssueGraphLiveness,
@@ -11105,7 +11238,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     },
 
-    cancelRun: (runId: string, reason?: string) => cancelRunInternal(runId, reason),
+    cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) => cancelRunInternal(runId, reason, options),
 
     cancelActiveForAgent: (agentId: string, reason?: string) => cancelActiveForAgentInternal(agentId, reason),
 
