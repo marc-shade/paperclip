@@ -5733,7 +5733,38 @@ export function issueRoutes(
 
     const checkoutRunId = requireAgentRunId(req, res);
     if (req.actor.type === "agent" && !checkoutRunId) return;
-    const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
+    let updated: Awaited<ReturnType<typeof svc.checkout>>;
+    try {
+      updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
+    } catch (error) {
+      // A routine_execution issue cannot be checked out (set in_progress) while a sibling
+      // execution of the same routine holds the open slot — Postgres raises 23505 on
+      // issues_open_routine_execution_uq. Surface a clear 409 instead of an opaque 500.
+      // Walk the error cause-chain (Drizzle wraps the raw pg error) and accept either the
+      // `constraint` or `constraint_name` field, matching companies.ts isIssuePrefixConflict.
+      let isOpenExecutionConflict = false;
+      const seen = new Set<unknown>();
+      let current: unknown = error;
+      while (typeof current === "object" && current !== null && !seen.has(current)) {
+        seen.add(current);
+        const maybe = current as { code?: string; constraint?: string; constraint_name?: string; cause?: unknown };
+        const constraint = maybe.constraint ?? maybe.constraint_name;
+        if (maybe.code === "23505" && constraint === "issues_open_routine_execution_uq") {
+          isOpenExecutionConflict = true;
+          break;
+        }
+        current = maybe.cause;
+      }
+      if (isOpenExecutionConflict) {
+        res.status(409).json({
+          error:
+            "Another execution of this routine is already open; cannot check out this routine_execution while a sibling holds the open slot.",
+          code: "open_routine_execution_conflict",
+        });
+        return;
+      }
+      throw error;
+    }
     const actor = getActorInfo(req);
 
     await logActivity(db, {

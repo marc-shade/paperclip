@@ -344,4 +344,48 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionRunId: currentRunId,
     });
   });
+
+  it("returns 409 (not an opaque 500) when checking out a routine_execution while a sibling holds the open slot", async () => {
+    const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
+    const originId = randomUUID();
+    const originFingerprint = "routine-fp-1";
+
+    // Sibling A already occupies the partial unique slot (issues_open_routine_execution_uq):
+    // routine_execution + executionRunId not null + active status.
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "Open sibling execution",
+      status: "in_progress",
+      priority: "medium",
+      originKind: "routine_execution",
+      originId,
+      originFingerprint,
+      executionRunId: failedRunId,
+    });
+
+    // Issue B is the same routine_execution, not yet open (executionRunId null), assigned to us.
+    const bId = randomUUID();
+    await db.insert(issues).values({
+      id: bId,
+      companyId,
+      title: "Stale duplicate execution to check out",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      originKind: "routine_execution",
+      originId,
+      originFingerprint,
+      executionRunId: null,
+    });
+
+    // Checking out B sets it in_progress + executionRunId -> violates the unique index
+    // because A holds the slot. This must surface as a clear 409, not an opaque 500.
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${bId}/checkout`)
+      .send({ agentId, expectedStatuses: ["todo"] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.code).toBe("open_routine_execution_conflict");
+  });
 });
