@@ -27,8 +27,33 @@ export interface AgentModelProfileConfig {
   adapterConfig: Record<string, unknown>;
 }
 
+/**
+ * One fallback provider in an agent's provider cascade. When the agent's
+ * primary adapter run fails because the provider is exhausted (credit/usage
+ * limit reached, or an auth wall that will not clear on its own), the engine
+ * re-runs the same issue on the next enabled cascade entry's adapter + config.
+ */
+export interface ProviderCascadeEntry {
+  /** Optional human label, e.g. "Claude failover (claude-opus-4-8)". */
+  label?: string;
+  /** Defaults to true. An entry with `enabled === false` is skipped. */
+  enabled?: boolean;
+  /** Adapter to fail over to, e.g. "claude_local". Required. */
+  adapterType: AgentAdapterType;
+  /** Full adapter config for this fallback (model, command, etc.). */
+  adapterConfig: Record<string, unknown>;
+}
+
+export interface ProviderCascade {
+  /** Master switch for this agent's cascade. Active only when `=== true`. */
+  enabled?: boolean;
+  /** Ordered fallback providers, tried top to bottom after the primary. */
+  entries: ProviderCascadeEntry[];
+}
+
 export interface AgentRuntimeConfig extends Record<string, unknown> {
   modelProfiles?: Partial<Record<ModelProfileKey, AgentModelProfileConfig>>;
+  providerCascade?: ProviderCascade;
 }
 
 export type AgentInstructionsBundleMode = "managed" | "external";

@@ -56,7 +56,7 @@ import { conflict, HttpError, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
-import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
+import { getServerAdapter, findActiveServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
 import type {
   AdapterExecutionResult,
   AdapterInvocationMeta,
@@ -339,6 +339,94 @@ function readTransientRecoveryContractFromRun(
         retryNotBefore: readTransientRetryNotBeforeFromRun(run),
       }
     : null;
+}
+
+// --- Provider cascade failover -----------------------------------------------
+// When an agent's primary adapter run fails because the provider is exhausted
+// (usage/credit limit reached, or an auth wall that will not clear on its own),
+// re-run the same issue on the next enabled cascade entry's adapter. Gated by
+// PAPERCLIP_PROVIDER_CASCADE so the feature ships dark: with the gate off the
+// engine behaves exactly as before, letting the failover be proven on a test
+// agent before any live agent depends on it.
+const PROVIDER_CASCADE_RETRY_REASON = "provider_cascade";
+const PROVIDER_CASCADE_WAKE_REASON = "provider_cascade_retry";
+
+// PAPERCLIP_PROVIDER_CASCADE controls activation:
+//   unset / empty        -> off (default; the feature ships dark)
+//   "true" | "all" | "1" -> on for every agent
+//   "<id>,<id>,..."      -> on only for the listed agent ids
+// The allowlist form lets the failover be proven on a single test agent before
+// any live agent depends on it.
+function isProviderCascadeFailoverEnabled(agent: Pick<typeof agents.$inferSelect, "id">): boolean {
+  const raw = process.env.PAPERCLIP_PROVIDER_CASCADE?.trim();
+  if (!raw) return false;
+  if (raw === "true" || raw === "all" || raw === "1") return true;
+  return raw
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .includes(agent.id);
+}
+
+export interface ResolvedProviderCascadeEntry {
+  /** 0-based index within the *enabled* cascade entries. */
+  index: number;
+  label: string | null;
+  adapterType: string;
+  adapterConfig: Record<string, unknown>;
+}
+
+export function readEnabledProviderCascadeEntries(
+  agent: Pick<typeof agents.$inferSelect, "runtimeConfig">,
+): ResolvedProviderCascadeEntry[] {
+  const runtimeConfig = parseObject(agent.runtimeConfig);
+  const cascade = parseObject(runtimeConfig.providerCascade);
+  if (cascade.enabled !== true) return [];
+  const rawEntries = Array.isArray(cascade.entries) ? cascade.entries : [];
+  const resolved: ResolvedProviderCascadeEntry[] = [];
+  for (const raw of rawEntries) {
+    const entry = parseObject(raw);
+    if (entry.enabled === false) continue;
+    const adapterType = readNonEmptyString(entry.adapterType);
+    if (!adapterType) continue;
+    resolved.push({
+      index: resolved.length,
+      label: readNonEmptyString(entry.label),
+      adapterType,
+      adapterConfig: parseObject(entry.adapterConfig),
+    });
+  }
+  return resolved;
+}
+
+export function isProviderExhaustionFailover(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
+): boolean {
+  // Usage / credit / rate-limit exhaustion surfaces under the transient_upstream
+  // family carrying a reset window (retryNotBefore) — "blocked until <time>".
+  // Failing over to the next provider beats waiting for the reset, which can be
+  // hours away. A transient_upstream WITHOUT a reset window is a brief outage
+  // (high demand / 429 blip): prefer the quick same-provider retry, not a
+  // full provider switch, so it is intentionally NOT treated as exhaustion here.
+  const transient = readTransientRecoveryContractFromRun(run);
+  if (transient?.retryNotBefore != null) return true;
+  // An auth wall (expired/absent login) will not clear on its own.
+  return run.errorCode === "claude_auth_required";
+}
+
+export interface ProviderCascadeOverride {
+  entryIndex: number;
+  adapterType: string;
+  adapterConfig: Record<string, unknown>;
+}
+
+export function parseProviderCascadeOverride(value: unknown): ProviderCascadeOverride | null {
+  const override = parseObject(value);
+  const adapterType = readNonEmptyString(override.adapterType);
+  if (!adapterType) return null;
+  const entryIndex = asNumber(override.entryIndex, -1);
+  if (!Number.isInteger(entryIndex) || entryIndex < 0) return null;
+  return { entryIndex, adapterType, adapterConfig: parseObject(override.adapterConfig) };
 }
 
 function mergeAdapterRecoveryMetadata(input: {
@@ -6004,6 +6092,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       wakeReason?: string;
       maxAttempts?: number;
       delayMs?: number;
+      extraContextSnapshot?: Record<string, unknown>;
+      stripSessionResume?: boolean;
     },
   ) {
     const now = opts?.now ?? new Date();
@@ -6117,8 +6207,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
+    const carriedContextSnapshot = { ...contextSnapshot };
+    if (opts?.stripSessionResume) {
+      // A cascade re-run switches adapters; the fallback must start a clean
+      // session, not resume the exhausted provider's session.
+      delete carriedContextSnapshot.resumeSessionParams;
+      delete carriedContextSnapshot.resumeSessionDisplayId;
+      delete carriedContextSnapshot.resumeFromRunId;
+    }
     const retryContextSnapshot: Record<string, unknown> = withRecoveryModelProfileHint({
-      ...contextSnapshot,
+      ...carriedContextSnapshot,
       retryOfRunId: run.id,
       wakeReason,
       retryReason,
@@ -6127,6 +6225,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       scheduledRetryAt: schedule.dueAt.toISOString(),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
+      ...(opts?.extraContextSnapshot ?? {}),
     }, "normal_model");
     const maxTurnContinuationIdempotencyKey = retryReason === MAX_TURN_CONTINUATION_RETRY_REASON
       ? `max-turn-continuation:${run.companyId}:${issueId ?? "no-issue"}:${run.id}:${schedule.attempt}`
@@ -6659,6 +6758,62 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       maxAttempts: Math.max(0, Math.min(MAX_TURN_CONTINUATION_MAX_ATTEMPTS_CAP, rawMaxAttempts)),
       delayMs: Math.max(0, Math.min(MAX_TURN_CONTINUATION_MAX_DELAY_MS, rawDelayMs)),
     };
+  }
+
+  // Enqueue a re-run of the same issue on the next provider-cascade entry by
+  // reusing the bounded-retry machinery (issue-lock transfer, wakeup creation,
+  // invokability gate, gate-checked promotion). The chosen entry rides in
+  // contextSnapshot.providerCascadeOverride; executeRun applies it on pickup.
+  async function scheduleProviderCascadeRetry(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    entry: ResolvedProviderCascadeEntry,
+  ) {
+    return scheduleBoundedRetryForRun(run, agent, {
+      retryReason: PROVIDER_CASCADE_RETRY_REASON,
+      wakeReason: PROVIDER_CASCADE_WAKE_REASON,
+      // Fail over immediately; do not wait for the exhausted provider's reset.
+      delayMs: 0,
+      // The cascade is bounded by entry count at the decision site; this cap is
+      // set so the bounded-retry counter never falsely exhausts a real hop.
+      maxAttempts: (run.scheduledRetryAttempt ?? 0) + 1,
+      stripSessionResume: true,
+      extraContextSnapshot: {
+        providerCascadeOverride: {
+          entryIndex: entry.index,
+          adapterType: entry.adapterType,
+          adapterConfig: entry.adapterConfig,
+        },
+        forceFreshSession: true,
+      },
+    });
+  }
+
+  // Decide and (if applicable) enqueue a provider-cascade failover for a failed
+  // run. Shared by the run-finalize decision site and the service entrypoint so
+  // both follow identical logic. Returns "not_eligible" when the gate is off,
+  // the failure is not provider exhaustion, or the agent has no cascade;
+  // "exhausted" when the cascade has no remaining entry.
+  async function maybeScheduleProviderCascadeFailover(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+  ): Promise<
+    | { outcome: "scheduled"; entryIndex: number; adapterType: string }
+    | { outcome: "exhausted" }
+    | { outcome: "not_eligible" }
+  > {
+    if (!isProviderCascadeFailoverEnabled(agent)) return { outcome: "not_eligible" };
+    if (!isProviderExhaustionFailover(run)) return { outcome: "not_eligible" };
+    const cascadeEntries = readEnabledProviderCascadeEntries(agent);
+    if (cascadeEntries.length === 0) return { outcome: "not_eligible" };
+    const activeOverride = parseProviderCascadeOverride(
+      parseObject(run.contextSnapshot).providerCascadeOverride,
+    );
+    const nextEntryIndex = (activeOverride?.entryIndex ?? -1) + 1;
+    if (nextEntryIndex >= cascadeEntries.length) return { outcome: "exhausted" };
+    const entry = cascadeEntries[nextEntryIndex];
+    await scheduleProviderCascadeRetry(run, agent, entry);
+    return { outcome: "scheduled", entryIndex: entry.index, adapterType: entry.adapterType };
   }
 
   function issueRunPriorityRank(priority: string | null | undefined) {
@@ -7734,6 +7889,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const failedRun = await getRun(runId);
       if (failedRun) await releaseIssueExecutionAndPromote(failedRun);
       return;
+    }
+
+    // Provider cascade failover: a prior provider was exhausted and this run was
+    // enqueued carrying the next cascade entry. getAgent() returns a fresh row,
+    // so overriding the in-memory adapter identity here redirects every
+    // downstream adapterType/adapterConfig consumer (session codec,
+    // getServerAdapter, JWT, config pipeline) for this run only. Fail closed:
+    // ignore an override whose adapter is not a registered active adapter so a
+    // corrupt context can never select a phantom provider.
+    const providerCascadeOverride = parseProviderCascadeOverride(
+      parseObject(run.contextSnapshot).providerCascadeOverride,
+    );
+    if (providerCascadeOverride && findActiveServerAdapter(providerCascadeOverride.adapterType)) {
+      agent.adapterType = providerCascadeOverride.adapterType;
+      // Merge, don't replace: keep the agent's workspace/instructions/env
+      // context (cwd, instructionsFilePath, env, …) so the fallback provider
+      // runs the SAME issue in the SAME workspace with the SAME instructions,
+      // and overlay only the fallback's provider fields (model, command, effort).
+      // The cascade entry wins on any shared key.
+      agent.adapterConfig = {
+        ...parseObject(agent.adapterConfig),
+        ...providerCascadeOverride.adapterConfig,
+      };
     }
 
     const runtime = await ensureRuntimeState(agent);
@@ -9144,8 +9322,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               },
             });
           }
-        } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
-          await scheduleBoundedRetryForRun(livenessRun, agent);
+        } else if (outcome === "failed") {
+          // Provider-cascade failover takes precedence over a same-provider
+          // transient retry: if the primary is exhausted and a fallback entry is
+          // available, re-run on it. Otherwise fall back to the normal bounded
+          // transient retry (unchanged behavior; this also covers the last
+          // provider once the cascade is exhausted).
+          const cascadeOutcome = await maybeScheduleProviderCascadeFailover(livenessRun, agent);
+          if (cascadeOutcome.outcome !== "scheduled" && readTransientRecoveryContractFromRun(livenessRun)) {
+            await scheduleBoundedRetryForRun(livenessRun, agent);
+          }
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
         await releaseIssueExecutionAndPromote(livenessRun);
@@ -11174,6 +11360,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const agent = await getAgent(run.agentId);
       if (!agent) return { outcome: "missing_agent" as const };
       return scheduleBoundedRetryForRun(run, agent, opts);
+    },
+
+    evaluateProviderCascadeFailover: async (runId: string) => {
+      const run = await getRun(runId, { unsafeFullResultJson: true });
+      if (!run) return { outcome: "missing_run" as const };
+      const agent = await getAgent(run.agentId);
+      if (!agent) return { outcome: "missing_agent" as const };
+      return maybeScheduleProviderCascadeFailover(run, agent);
     },
 
     reconcileStrandedAssignedIssues,

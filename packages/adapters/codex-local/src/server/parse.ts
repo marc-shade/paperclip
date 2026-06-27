@@ -8,8 +8,13 @@ import {
 const CODEX_TRANSIENT_UPSTREAM_RE =
   /(?:we(?:'|’)re\s+currently\s+experiencing\s+high\s+demand|temporary\s+errors|rate[-\s]?limit(?:ed)?|too\s+many\s+requests|\b429\b|server\s+overloaded|service\s+unavailable|try\s+again\s+later)/i;
 const CODEX_REMOTE_COMPACTION_RE = /remote\s+compact\s+task/i;
+// Matches the codex usage-limit / credit-exhaustion message and captures the
+// reset time. Tolerant of the CLI's differing phrasings between the "switch to
+// another model now, or try again at <time>" and "…purchase more credits or try
+// again at <time>" variants (and any future wording between the limit notice
+// and the reset clock).
 const CODEX_USAGE_LIMIT_RE =
-  /you(?:'|’)ve hit your usage limit for .+\.\s+switch to another model now,\s+or try again at\s+([^.!\n]+)(?:[.!]|\n|$)/i;
+  /you(?:'|’)ve hit your usage limit\b[\s\S]{0,200}?\btry again at\s+([^.!\n]+)(?:[.!]|\n|$)/i;
 
 export function parseCodexJsonl(stdout: string) {
   let sessionId: string | null = null;

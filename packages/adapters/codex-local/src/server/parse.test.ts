@@ -113,6 +113,20 @@ describe("isCodexTransientUpstreamError", () => {
     );
   });
 
+  it("classifies the 'purchase more credits' usage-limit message and extracts the retry time", () => {
+    // The live codex CLI message format (2026-06): no "for <model>" clause and
+    // "purchase more credits or try again at <time>" instead of "switch to
+    // another model now". Must still classify as transient + extract the reset.
+    const errorMessage =
+      "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 10:26 AM.";
+    const now = new Date(2026, 5, 27, 8, 0, 0);
+
+    expect(isCodexTransientUpstreamError({ errorMessage })).toBe(true);
+    expect(extractCodexRetryNotBefore({ errorMessage }, now)?.getTime()).toBe(
+      new Date(2026, 5, 27, 10, 26, 0, 0).getTime(),
+    );
+  });
+
   it("parses explicit timezone hints on usage-limit retry windows", () => {
     const errorMessage = "You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at 11:31 PM (America/Chicago).";
     const now = new Date("2026-04-23T03:29:02.000Z");

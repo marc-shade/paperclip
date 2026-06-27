@@ -60,10 +60,27 @@ const agentModelProfileConfigSchema = z.object({
   adapterConfig: adapterConfigSchema,
 }).strict();
 
+// One fallback provider in an agent's provider cascade. `adapterType` is
+// required (no "process" default) so a misconfigured entry is rejected at
+// write time rather than silently selecting the passthrough adapter at run
+// time.
+const providerCascadeEntrySchema = z.object({
+  label: z.string().trim().min(1).optional(),
+  enabled: z.boolean().optional(),
+  adapterType: z.string().trim().min(1),
+  adapterConfig: adapterConfigSchema.optional().default({}),
+}).strict();
+
+export const providerCascadeSchema = z.object({
+  enabled: z.boolean().optional(),
+  entries: z.array(providerCascadeEntrySchema).optional().default([]),
+}).strict();
+
 export const agentRuntimeConfigSchema = z.object({
   modelProfiles: z.object({
     cheap: agentModelProfileConfigSchema.optional(),
   }).strict().optional(),
+  providerCascade: providerCascadeSchema.optional(),
 }).catchall(z.unknown());
 
 export const createAgentSchema = z.object({
