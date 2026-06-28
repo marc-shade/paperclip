@@ -152,7 +152,7 @@ import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
-import { recoveryService } from "./recovery/service.js";
+import { recoveryService, ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS } from "./recovery/service.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
 import {
@@ -7555,25 +7555,62 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
-        if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
-          const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
-          const detachedRun = await setRunStatus(run.id, "running", {
-            error: detachedMessage,
-            errorCode: DETACHED_PROCESS_ERROR_CODE,
-          });
-          if (detachedRun) {
-            await appendRunEvent(detachedRun, await nextRunEventSeq(detachedRun.id), {
-              eventType: "lifecycle",
-              stream: "system",
-              level: "warn",
-              message: detachedMessage,
-              payload: {
-                processPid: run.processPid,
-              },
+        // Only force-terminate a detached child once we have POSITIVE evidence it is hung:
+        // it was already marked detached on a prior pass, it produced run-log output before,
+        // and that output has been silent past the watchdog's critical threshold. Otherwise
+        // preserve it — an alive process may still be doing legitimate work, and a run that
+        // never produced output (null lastOutputAt) is left to the normal detached handling.
+        const silentForMs = run.lastOutputAt
+          ? now.getTime() - new Date(run.lastOutputAt).getTime()
+          : null;
+        const hungPastCritical =
+          run.errorCode === DETACHED_PROCESS_ERROR_CODE &&
+          silentForMs !== null &&
+          silentForMs >= ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS;
+        if (!hungPastCritical) {
+          // Preserve the live (possibly-working) run; mark it detached once for visibility.
+          if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
+            const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
+            const detachedRun = await setRunStatus(run.id, "running", {
+              error: detachedMessage,
+              errorCode: DETACHED_PROCESS_ERROR_CODE,
             });
+            if (detachedRun) {
+              await appendRunEvent(detachedRun, await nextRunEventSeq(detachedRun.id), {
+                eventType: "lifecycle",
+                stream: "system",
+                level: "warn",
+                message: detachedMessage,
+                payload: {
+                  processPid: run.processPid,
+                },
+              });
+            }
           }
+          continue;
         }
-        continue;
+        // Detached AND silent past the watchdog's critical threshold: the child is hung.
+        // Force-terminate so it gets reaped here, instead of lingering in "running" forever
+        // (which made the output-silence watchdog refile review work every tick — a stuck
+        // run could never be cleared until the process happened to die or a daemon restart).
+        await terminateHeartbeatRunProcess({
+          pid: run.processPid,
+          processGroupId: run.processGroupId,
+        });
+        await appendRunEvent(run, await nextRunEventSeq(run.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message: `Detached child pid ${run.processPid} silent for ${Math.round(
+            (silentForMs ?? 0) / 60000,
+          )}m (>= critical output-silence threshold); terminating and reaping`,
+          payload: {
+            processPid: run.processPid,
+            ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
+            silentForMs,
+          },
+        });
+        // fall through to the reap path below to finalize + release this run.
       }
 
       let descendantOnlyCleanup = false;

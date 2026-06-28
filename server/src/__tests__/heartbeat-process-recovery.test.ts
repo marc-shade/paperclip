@@ -971,6 +971,40 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(wakeup?.status).toBe("claimed");
   });
 
+  it("terminates and reaps a detached local run that is alive but silent past the critical output threshold", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    expect(child.pid).toBeTypeOf("number");
+
+    const { runId } = await seedRunFixture({
+      processPid: child.pid ?? null,
+      // Already marked detached on a prior reaper pass, and retry budget exhausted so the
+      // reap path produces a clean terminal failure (no follow-up retry run).
+      runErrorCode: "process_detached",
+      processLossRetryCount: 1,
+      includeIssue: false,
+    });
+
+    // It produced output before, then went silent well past the 4h critical threshold.
+    await db
+      .update(heartbeatRuns)
+      .set({ lastOutputAt: new Date(Date.now() - 5 * 60 * 60 * 1000) })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toContain(runId);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+
+    // The hung child must actually be force-terminated.
+    expect(await waitForPidExit(child.pid as number, 2_000)).toBe(true);
+  });
+
   it("queues exactly one retry when the recorded local pid is dead", async () => {
     const { agentId, runId, issueId } = await seedRunFixture({
       agentStatus: "idle",
