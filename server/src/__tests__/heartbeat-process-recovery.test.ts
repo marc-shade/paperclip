@@ -1053,12 +1053,19 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .where(eq(issues.id, issueId))
         .then((rows) => {
           const row = rows[0] ?? null;
-          return row?.executionRunId === retryRun?.id ? row : null;
+          // Wait for the stable end state: the live retry run owns BOTH the execution
+          // and checkout locks (this removes the prior race where the assertion could fire
+          // between the dead-run cleanup and the retry re-acquiring the checkout).
+          return row?.executionRunId === retryRun?.id && row?.checkoutRunId === retryRun?.id
+            ? row
+            : null;
         })
     );
     expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
-    // Terminal run cleanup releases the checkout lock so future checkout 409s only mean a live owner exists.
-    expect(issue?.checkoutRunId).toBeNull();
+    // The queued retry is the live owner and holds the checkout lock (replacing the dead
+    // run's), so a future checkout 409 correctly reflects the live retry — not a stale dead
+    // run, and not an unlocked issue another agent could grab while the retry is executing.
+    expect(issue?.checkoutRunId).toBe(retryRun?.id ?? null);
   });
 
   it("releases active environment leases when an orphaned run is reaped", async () => {
