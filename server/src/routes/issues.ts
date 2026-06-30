@@ -3129,21 +3129,49 @@ export function issueRoutes(
     }
     const offset = parsedOffset ?? 0;
 
+    // UUID-typed issue filters: validate (and normalize) up front so a malformed id returns
+    // 422 instead of surfacing a Postgres 22P02 ("invalid input syntax for type uuid") as a 500.
+    // originId/originKind are text columns and are intentionally excluded.
+    const uuidFilters: Record<string, string | undefined> = {};
+    for (const name of [
+      "parentId",
+      "descendantOf",
+      "projectId",
+      "workspaceId",
+      "executionWorkspaceId",
+      "participantAgentId",
+      "labelId",
+    ] as const) {
+      const raw = req.query[name];
+      if (raw === undefined) continue;
+      if (typeof raw !== "string") {
+        res.status(422).json({ error: `${name} must be a valid UUID when provided` });
+        return;
+      }
+      const trimmed = raw.trim();
+      if (trimmed.length === 0) continue;
+      if (!isUuidLike(trimmed)) {
+        res.status(422).json({ error: `${name} must be a valid UUID when provided` });
+        return;
+      }
+      uuidFilters[name] = trimmed;
+    }
+
     const rawResult = await svc.list(companyId, {
       attention: attention === "blocked" ? "blocked" : undefined,
       status: req.query.status as string | string[] | undefined,
       assigneeAgentId,
-      participantAgentId: req.query.participantAgentId as string | undefined,
+      participantAgentId: uuidFilters.participantAgentId,
       assigneeUserId,
       touchedByUserId,
       inboxArchivedByUserId,
       unreadForUserId,
-      projectId: req.query.projectId as string | undefined,
-      workspaceId: req.query.workspaceId as string | undefined,
-      executionWorkspaceId: req.query.executionWorkspaceId as string | undefined,
-      parentId: req.query.parentId as string | undefined,
-      descendantOf: req.query.descendantOf as string | undefined,
-      labelId: req.query.labelId as string | undefined,
+      projectId: uuidFilters.projectId,
+      workspaceId: uuidFilters.workspaceId,
+      executionWorkspaceId: uuidFilters.executionWorkspaceId,
+      parentId: uuidFilters.parentId,
+      descendantOf: uuidFilters.descendantOf,
+      labelId: uuidFilters.labelId,
       originKind: req.query.originKind as string | undefined,
       originKindPrefix: req.query.originKindPrefix as string | undefined,
       originId: req.query.originId as string | undefined,
@@ -3213,18 +3241,46 @@ export function issueRoutes(
       return;
     }
 
+    // UUID-typed issue filters: validate (and normalize) up front so a malformed id returns
+    // 422 instead of surfacing a Postgres 22P02 ("invalid input syntax for type uuid") as a 500.
+    // originId/originKind are text columns and are intentionally excluded.
+    const uuidFilters: Record<string, string | undefined> = {};
+    for (const name of [
+      "parentId",
+      "descendantOf",
+      "projectId",
+      "workspaceId",
+      "executionWorkspaceId",
+      "participantAgentId",
+      "labelId",
+    ] as const) {
+      const raw = req.query[name];
+      if (raw === undefined) continue;
+      if (typeof raw !== "string") {
+        res.status(422).json({ error: `${name} must be a valid UUID when provided` });
+        return;
+      }
+      const trimmed = raw.trim();
+      if (trimmed.length === 0) continue;
+      if (!isUuidLike(trimmed)) {
+        res.status(422).json({ error: `${name} must be a valid UUID when provided` });
+        return;
+      }
+      uuidFilters[name] = trimmed;
+    }
+
     const blockedCountFilters = {
       attention: "blocked",
       status: req.query.status as string | string[] | undefined,
       assigneeAgentId: req.query.assigneeAgentId as string | undefined,
-      participantAgentId: req.query.participantAgentId as string | undefined,
+      participantAgentId: uuidFilters.participantAgentId,
       assigneeUserId: req.query.assigneeUserId as string | undefined,
-      projectId: req.query.projectId as string | undefined,
-      workspaceId: req.query.workspaceId as string | undefined,
-      executionWorkspaceId: req.query.executionWorkspaceId as string | undefined,
-      parentId: req.query.parentId as string | undefined,
-      descendantOf: req.query.descendantOf as string | undefined,
-      labelId: req.query.labelId as string | undefined,
+      projectId: uuidFilters.projectId,
+      workspaceId: uuidFilters.workspaceId,
+      executionWorkspaceId: uuidFilters.executionWorkspaceId,
+      parentId: uuidFilters.parentId,
+      descendantOf: uuidFilters.descendantOf,
+      labelId: uuidFilters.labelId,
       originKind: req.query.originKind as string | undefined,
       originKindPrefix: req.query.originKindPrefix as string | undefined,
       originId: req.query.originId as string | undefined,

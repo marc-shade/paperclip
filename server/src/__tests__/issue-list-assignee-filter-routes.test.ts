@@ -220,4 +220,103 @@ describeEmbeddedPostgres("issue list routes assigneeAgentId filter", () => {
       error: "assigneeAgentId must be a UUID or 'null'",
     });
   });
+
+  it("keeps valid parentId filtering behavior unchanged", async () => {
+    const companyId = randomUUID();
+    const parentIssueId = randomUUID();
+    const childIssueId = randomUUID();
+    const unrelatedIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: uniqueIssuePrefix(),
+      requireBoardApprovalForNewAgents: false,
+    });
+    await seedCloudTenantMember(companyId);
+    await db.insert(issues).values([
+      { id: parentIssueId, companyId, title: "Parent", status: "todo", priority: "medium" },
+      {
+        id: childIssueId,
+        companyId,
+        title: "Child",
+        status: "todo",
+        priority: "medium",
+        parentId: parentIssueId,
+      },
+      { id: unrelatedIssueId, companyId, title: "Unrelated", status: "todo", priority: "medium" },
+    ]);
+
+    const app = createApp(companyId);
+    const res = await request(app)
+      .get(`/api/companies/${companyId}/issues`)
+      .query({ parentId: parentIssueId, limit: "20" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.map((issue: { id: string }) => issue.id)).toEqual([childIssueId]);
+  });
+
+  it("returns 422 for a malformed parentId filter instead of a 500", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: uniqueIssuePrefix(),
+      requireBoardApprovalForNewAgents: false,
+    });
+    await seedCloudTenantMember(companyId);
+
+    const app = createApp(companyId);
+    // Truncated UUID — previously surfaced a Postgres 22P02 as an unhandled 500.
+    const res = await request(app)
+      .get(`/api/companies/${companyId}/issues`)
+      .query({ parentId: "25f763f1", limit: "20" });
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({
+      error: "parentId must be a valid UUID when provided",
+    });
+  });
+
+  it("returns 422 for a malformed projectId filter", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: uniqueIssuePrefix(),
+      requireBoardApprovalForNewAgents: false,
+    });
+    await seedCloudTenantMember(companyId);
+
+    const app = createApp(companyId);
+    const res = await request(app)
+      .get(`/api/companies/${companyId}/issues`)
+      .query({ projectId: "not-a-uuid", limit: "20" });
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({
+      error: "projectId must be a valid UUID when provided",
+    });
+  });
+
+  it("returns 422 for a malformed parentId on the blocked-count route", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: uniqueIssuePrefix(),
+      requireBoardApprovalForNewAgents: false,
+    });
+    await seedCloudTenantMember(companyId);
+
+    const app = createApp(companyId);
+    const res = await request(app)
+      .get(`/api/companies/${companyId}/issues/count`)
+      .query({ attention: "blocked", parentId: "25f763f1" });
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({
+      error: "parentId must be a valid UUID when provided",
+    });
+  });
 });
