@@ -21,7 +21,9 @@ import {
 import {
   heartbeatService,
   isProviderExhaustionFailover,
+  messageIndicatesProviderExhaustion,
   parseProviderCascadeOverride,
+  providerExhaustionResultJsonPatch,
   readEnabledProviderCascadeEntries,
 } from "../services/heartbeat.ts";
 
@@ -147,6 +149,53 @@ describe("provider cascade pure helpers", () => {
       ).toBe(false);
     });
 
+    it("is true for a usage-limit wall with NO reset window via the error message", () => {
+      // The real codex_local failure: transient_upstream, no retryNotBefore, the
+      // usage-limit text only present on the error string.
+      expect(
+        isProviderExhaustionFailover({
+          errorCode: "codex_transient_upstream",
+          resultJson: { errorFamily: "transient_upstream" },
+          error:
+            "You've hit your usage limit. Upgrade to Pro or purchase more credits.",
+        }),
+      ).toBe(true);
+    });
+
+    it("is true for a persisted exhaustion marker even when the error is absent", () => {
+      // Layer-2: the finalize decision cannot rely on the in-memory `.error`, so
+      // the durable resultJson marker must be sufficient on its own.
+      expect(
+        isProviderExhaustionFailover({
+          errorCode: "codex_transient_upstream",
+          resultJson: { errorFamily: "transient_upstream", providerExhausted: true },
+          error: null,
+        }),
+      ).toBe(true);
+    });
+
+    it("stays false for a brief 429 blip whose message is not an exhaustion", () => {
+      expect(
+        isProviderExhaustionFailover({
+          errorCode: "codex_transient_upstream",
+          resultJson: { errorFamily: "transient_upstream" },
+          error: "Upstream returned 429 (server busy); please retry.",
+        }),
+      ).toBe(false);
+    });
+
+    it("does not treat a marker on a non-transient family as exhaustion", () => {
+      // The marker only means exhaustion within the transient_upstream family;
+      // a stray flag on an unrelated failure must not trigger a provider switch.
+      expect(
+        isProviderExhaustionFailover({
+          errorCode: "adapter_failed",
+          resultJson: { providerExhausted: true },
+          error: "purchase more credits",
+        }),
+      ).toBe(false);
+    });
+
     it("is true for an auth wall (claude_auth_required)", () => {
       expect(isProviderExhaustionFailover({ errorCode: "claude_auth_required", resultJson: {} })).toBe(true);
     });
@@ -176,6 +225,76 @@ describe("provider cascade pure helpers", () => {
       expect(parseProviderCascadeOverride({ entryIndex: 0 })).toBeNull(); // no adapterType
       expect(parseProviderCascadeOverride({ adapterType: "claude_local", entryIndex: -1 })).toBeNull();
       expect(parseProviderCascadeOverride({ adapterType: "claude_local", entryIndex: "x" })).toBeNull();
+    });
+  });
+
+  describe("messageIndicatesProviderExhaustion", () => {
+    it("matches genuine usage/credit/quota exhaustion messages", () => {
+      for (const message of [
+        "You've hit your usage limit. Upgrade to Pro or purchase more credits.",
+        "You have hit your usage limit.",
+        "Out of credits — please add more.",
+        "Quota exceeded for this billing period.",
+        "insufficient balance to complete the request",
+        "Upgrade to Pro to continue.",
+      ]) {
+        expect(messageIndicatesProviderExhaustion(message)).toBe(true);
+      }
+    });
+
+    it("does not match brief transient/other failures", () => {
+      for (const message of [
+        "Upstream returned 429 (server busy); please retry.",
+        "connection reset by peer",
+        "The model produced no output.",
+        "",
+        null,
+        undefined,
+      ]) {
+        expect(messageIndicatesProviderExhaustion(message)).toBe(false);
+      }
+    });
+  });
+
+  describe("providerExhaustionResultJsonPatch", () => {
+    it("marks a codex usage-limit wall (transient_upstream family from errorCode)", () => {
+      expect(
+        providerExhaustionResultJsonPatch({
+          errorCode: "codex_transient_upstream",
+          errorMessage: "You've hit your usage limit. purchase more credits.",
+          resultJson: null,
+        }),
+      ).toEqual({ providerExhausted: true });
+    });
+
+    it("marks when the transient family comes from persisted resultJson", () => {
+      expect(
+        providerExhaustionResultJsonPatch({
+          errorCode: "claude_transient_upstream",
+          errorMessage: "quota reached for your plan",
+          resultJson: { errorFamily: "transient_upstream" },
+        }),
+      ).toEqual({ providerExhausted: true });
+    });
+
+    it("returns null for a transient blip with no exhaustion signature", () => {
+      expect(
+        providerExhaustionResultJsonPatch({
+          errorCode: "codex_transient_upstream",
+          errorMessage: "Upstream returned 429 (server busy); please retry.",
+          resultJson: null,
+        }),
+      ).toBeNull();
+    });
+
+    it("returns null for a non-transient failure even with an exhaustion-looking message", () => {
+      expect(
+        providerExhaustionResultJsonPatch({
+          errorCode: "adapter_failed",
+          errorMessage: "purchase more credits",
+          resultJson: null,
+        }),
+      ).toBeNull();
     });
   });
 });
@@ -230,6 +349,7 @@ describeEmbeddedPostgres("heartbeat provider cascade failover", () => {
     agentId: string;
     now: Date;
     errorCode: string;
+    error?: string;
     resultJson?: Record<string, unknown> | null;
     cascade?: unknown;
     contextSnapshot?: Record<string, unknown>;
@@ -262,7 +382,7 @@ describeEmbeddedPostgres("heartbeat provider cascade failover", () => {
       agentId: input.agentId,
       invocationSource: "assignment",
       status: "failed",
-      error: "usage limit reached",
+      error: input.error ?? "usage limit reached",
       errorCode: input.errorCode,
       finishedAt: input.now,
       scheduledRetryAttempt: 0,
@@ -468,6 +588,97 @@ describeEmbeddedPostgres("heartbeat provider cascade failover", () => {
       errorCode: "codex_transient_upstream",
       resultJson: exhaustionResultJson,
       // no cascade
+    });
+
+    const result = await heartbeat.evaluateProviderCascadeFailover(runId);
+    expect(result).toEqual({ outcome: "not_eligible" });
+    expect(await findEnqueuedCascadeRun(runId)).toBeNull();
+  });
+
+  // The regression this fix targets: a real codex usage-limit wall arrives as a
+  // transient_upstream failure with the "purchase more credits" text on the error
+  // and NO retryNotBefore reset window. Before the fix this fell through to a
+  // same-provider transient_failure retry; it must now fail over to claude_local.
+  it("fails over a codex usage-limit wall (transient_upstream, NO reset window) to claude_local", async () => {
+    restoreGate = withCascadeGate(true);
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    await seedCascadeFixture({
+      runId,
+      companyId: randomUUID(),
+      agentId: randomUUID(),
+      now: new Date(),
+      errorCode: "codex_transient_upstream",
+      error:
+        "You've hit your usage limit. Upgrade to Pro (https://openai.com/chatgpt/pricing) or purchase more credits.",
+      // transient_upstream family, but NO retryNotBefore — the codex adapter never
+      // populates a reset window on a usage/credit wall.
+      resultJson: { errorFamily: "transient_upstream" },
+      cascade: twoEntryCascade,
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+
+    const result = await heartbeat.evaluateProviderCascadeFailover(runId);
+    expect(result).toEqual({ outcome: "scheduled", entryIndex: 0, adapterType: "claude_local" });
+
+    const enqueued = await findEnqueuedCascadeRun(runId);
+    expect(enqueued).toMatchObject({
+      status: "scheduled_retry",
+      retryOfRunId: runId,
+      scheduledRetryReason: "provider_cascade",
+    });
+    const ctx = enqueued?.contextSnapshot as Record<string, unknown>;
+    expect(ctx.providerCascadeOverride).toEqual({
+      entryIndex: 0,
+      adapterType: "claude_local",
+      adapterConfig: { model: "claude-opus-4-8", command: "claude" },
+    });
+    expect(ctx.issueId).toBe(issueId);
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.runId, enqueued!.id))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.reason).toBe("provider_cascade_retry");
+  });
+
+  // Layer-2 proof: the durable resultJson marker persisted at finalize drives the
+  // failover even when the in-memory `.error` is absent at the decision site.
+  it("fails over on a persisted exhaustion marker even when the run error is empty", async () => {
+    restoreGate = withCascadeGate(true);
+    const runId = randomUUID();
+    await seedCascadeFixture({
+      runId,
+      companyId: randomUUID(),
+      agentId: randomUUID(),
+      now: new Date(),
+      errorCode: "codex_transient_upstream",
+      error: "", // decision must not depend on .error
+      resultJson: { errorFamily: "transient_upstream", providerExhausted: true },
+      cascade: twoEntryCascade,
+      contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+    });
+
+    const result = await heartbeat.evaluateProviderCascadeFailover(runId);
+    expect(result).toEqual({ outcome: "scheduled", entryIndex: 0, adapterType: "claude_local" });
+    expect(await findEnqueuedCascadeRun(runId)).not.toBeNull();
+  });
+
+  // A brief 429 blip (transient_upstream, no reset window, no exhaustion text) must
+  // still take the quick same-provider retry, NOT a full provider switch.
+  it("does not fail over a brief transient blip (no reset window, no exhaustion signature)", async () => {
+    restoreGate = withCascadeGate(true);
+    const runId = randomUUID();
+    await seedCascadeFixture({
+      runId,
+      companyId: randomUUID(),
+      agentId: randomUUID(),
+      now: new Date(),
+      errorCode: "codex_transient_upstream",
+      error: "Upstream provider returned 429 (server busy); please retry.",
+      resultJson: { errorFamily: "transient_upstream" },
+      cascade: twoEntryCascade,
     });
 
     const result = await heartbeat.evaluateProviderCascadeFailover(runId);
