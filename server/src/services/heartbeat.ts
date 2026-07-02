@@ -450,17 +450,72 @@ export function readEnabledProviderCascadeEntries(
   return resolved;
 }
 
+// A transient_upstream failure whose human-readable message positively identifies
+// a provider usage / credit / quota exhaustion (as opposed to a brief high-demand
+// 429 blip). codex_local surfaces "You've hit your usage limit … purchase more
+// credits" WITHOUT populating a retryNotBefore reset window, so the retryNotBefore
+// gate alone never fires on it — this signature recovers those cases so the run
+// can fail over to the next provider instead of dead-waiting for the exhausted
+// provider's quota to reset hours later.
+const PROVIDER_EXHAUSTION_ERROR_SIGNATURE =
+  /usage limit|purchase more credits|hit your usage|out of credits?|quota (?:exceeded|reached)|insufficient (?:credit|quota|balance)|upgrade to pro|billing (?:hard )?limit/i;
+
+// resultJson key for the durable exhaustion marker persisted at run-finalize.
+const PROVIDER_EXHAUSTED_RESULT_FLAG = "providerExhausted";
+
+/** True when an adapter error message positively identifies provider exhaustion. */
+export function messageIndicatesProviderExhaustion(message: string | null | undefined): boolean {
+  return typeof message === "string" && PROVIDER_EXHAUSTION_ERROR_SIGNATURE.test(message);
+}
+
+function readProviderExhaustedFlag(
+  resultJson: (typeof heartbeatRuns.$inferSelect)["resultJson"],
+): boolean {
+  return parseObject(resultJson)[PROVIDER_EXHAUSTED_RESULT_FLAG] === true;
+}
+
+// Compute the resultJson patch that records a provider-exhaustion marker for a
+// failed adapter run, or null when the failure is not an identifiable exhaustion.
+// Persisting the marker at finalize means the cascade decision can detect the
+// exhaustion from data that lives ON the run's resultJson — it does not depend on
+// the in-memory `.error` field, which is not reliably populated when the failover
+// decision runs inline at run-finalize. Scoped to the transient_upstream family so
+// ordinary failures (and brief 429 blips carrying no exhaustion message) are left
+// untouched.
+export function providerExhaustionResultJsonPatch(input: {
+  errorCode: string | null | undefined;
+  errorMessage: string | null | undefined;
+  resultJson?: Record<string, unknown> | null;
+}): { providerExhausted: true } | null {
+  const family = readHeartbeatRunErrorFamily({
+    errorCode: input.errorCode ?? null,
+    resultJson: input.resultJson ?? null,
+  });
+  if (family !== "transient_upstream") return null;
+  return messageIndicatesProviderExhaustion(input.errorMessage) ? { providerExhausted: true } : null;
+}
+
 export function isProviderExhaustionFailover(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson"> & {
+    error?: string | null;
+  },
 ): boolean {
   // Usage / credit / rate-limit exhaustion surfaces under the transient_upstream
-  // family carrying a reset window (retryNotBefore) — "blocked until <time>".
-  // Failing over to the next provider beats waiting for the reset, which can be
-  // hours away. A transient_upstream WITHOUT a reset window is a brief outage
-  // (high demand / 429 blip): prefer the quick same-provider retry, not a
-  // full provider switch, so it is intentionally NOT treated as exhaustion here.
+  // family. It IDEALLY carries a reset window (retryNotBefore) — "blocked until
+  // <time>" — and failing over to the next provider beats waiting for that reset,
+  // which can be hours away. But not every adapter populates a reset window
+  // (codex_local on a "purchase more credits" wall sets none), so also fail over
+  // when a durable exhaustion marker was persisted at finalize, or — as a
+  // secondary signal — the raw error message positively identifies a genuine
+  // exhaustion. A transient_upstream that is only a brief 429 blip (no reset
+  // window, no marker, no exhaustion signature) is intentionally left to the quick
+  // same-provider retry.
   const transient = readTransientRecoveryContractFromRun(run);
-  if (transient?.retryNotBefore != null) return true;
+  if (transient) {
+    if (transient.retryNotBefore != null) return true;
+    if (readProviderExhaustedFlag(run.resultJson)) return true;
+    if (messageIndicatesProviderExhaustion(run.error)) return true;
+  }
   // An auth wall (expired/absent login) will not clear on its own.
   return run.errorCode === "claude_auth_required";
 }
@@ -11272,6 +11327,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             } as Record<string, unknown>)
           : null;
 
+      // A provider usage/credit exhaustion (e.g. codex_local's "purchase more
+      // credits" wall) arrives as a transient_upstream failure with no reset
+      // window. Persist a durable marker into resultJson so the cascade decision
+      // can fail over to the next provider from data on the run object, without
+      // depending on the in-memory `.error` field at the finalize decision site.
+      const providerExhaustionPatch = providerExhaustionResultJsonPatch({
+        errorCode: runErrorCode,
+        errorMessage: runErrorMessage,
+        resultJson: adapterResult.resultJson ?? null,
+      });
       const persistedResultJson = mergeHeartbeatRunResultJson(
         mergeRunStopMetadataForAgent(agent, outcome, {
           resultJson: mergeModelProfileRunMetadata(
@@ -11279,6 +11344,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               resultJson: {
                 ...parseObject(adapterResult.resultJson),
                 configFreshness: configFreshnessResultMetadata,
+                ...(providerExhaustionPatch ?? {}),
               },
               errorFamily: adapterResult.errorFamily ?? null,
               retryNotBefore: adapterResult.retryNotBefore ?? null,
