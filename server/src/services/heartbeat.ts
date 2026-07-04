@@ -409,6 +409,148 @@ function readTransientRecoveryContractFromRun(
     : null;
 }
 
+// --- Provider cascade failover -----------------------------------------------
+// When an agent's primary adapter run fails because the provider is exhausted
+// (usage/credit limit reached, or an auth wall that will not clear on its own),
+// re-run the same issue on the next enabled cascade entry's adapter. Gated by
+// PAPERCLIP_PROVIDER_CASCADE so the feature ships dark: with the gate off the
+// engine behaves exactly as before, letting the failover be proven on a test
+// agent before any live agent depends on it.
+const PROVIDER_CASCADE_RETRY_REASON = "provider_cascade";
+const PROVIDER_CASCADE_WAKE_REASON = "provider_cascade_retry";
+
+// PAPERCLIP_PROVIDER_CASCADE controls activation:
+//   unset / empty        -> off (default; the feature ships dark)
+//   "true" | "all" | "1" -> on for every agent
+//   "<id>,<id>,..."      -> on only for the listed agent ids
+// The allowlist form lets the failover be proven on a single test agent before
+// any live agent depends on it.
+function isProviderCascadeFailoverEnabled(agent: Pick<typeof agents.$inferSelect, "id">): boolean {
+  const raw = process.env.PAPERCLIP_PROVIDER_CASCADE?.trim();
+  if (!raw) return false;
+  if (raw === "true" || raw === "all" || raw === "1") return true;
+  return raw
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .includes(agent.id);
+}
+
+export interface ResolvedProviderCascadeEntry {
+  /** 0-based index within the *enabled* cascade entries. */
+  index: number;
+  label: string | null;
+  adapterType: string;
+  adapterConfig: Record<string, unknown>;
+}
+
+export function readEnabledProviderCascadeEntries(
+  agent: Pick<typeof agents.$inferSelect, "runtimeConfig">,
+): ResolvedProviderCascadeEntry[] {
+  const runtimeConfig = parseObject(agent.runtimeConfig);
+  const cascade = parseObject(runtimeConfig.providerCascade);
+  if (cascade.enabled !== true) return [];
+  const rawEntries = Array.isArray(cascade.entries) ? cascade.entries : [];
+  const resolved: ResolvedProviderCascadeEntry[] = [];
+  for (const raw of rawEntries) {
+    const entry = parseObject(raw);
+    if (entry.enabled === false) continue;
+    const adapterType = readNonEmptyString(entry.adapterType);
+    if (!adapterType) continue;
+    resolved.push({
+      index: resolved.length,
+      label: readNonEmptyString(entry.label),
+      adapterType,
+      adapterConfig: parseObject(entry.adapterConfig),
+    });
+  }
+  return resolved;
+}
+
+// A transient_upstream failure whose human-readable message positively identifies
+// a provider usage / credit / quota exhaustion (as opposed to a brief high-demand
+// 429 blip). codex_local surfaces "You've hit your usage limit … purchase more
+// credits" WITHOUT populating a retryNotBefore reset window, so the retryNotBefore
+// gate alone never fires on it — this signature recovers those cases so the run
+// can fail over to the next provider instead of dead-waiting for the exhausted
+// provider's quota to reset hours later.
+const PROVIDER_EXHAUSTION_ERROR_SIGNATURE =
+  /usage limit|purchase more credits|hit your usage|out of credits?|quota (?:exceeded|reached)|quota will reset|exhausted your capacity|insufficient (?:credit|quota|balance)|upgrade to pro|billing (?:hard )?limit/i;
+
+// resultJson key for the durable exhaustion marker persisted at run-finalize.
+const PROVIDER_EXHAUSTED_RESULT_FLAG = "providerExhausted";
+
+/** True when an adapter error message positively identifies provider exhaustion. */
+export function messageIndicatesProviderExhaustion(message: string | null | undefined): boolean {
+  return typeof message === "string" && PROVIDER_EXHAUSTION_ERROR_SIGNATURE.test(message);
+}
+
+function readProviderExhaustedFlag(
+  resultJson: (typeof heartbeatRuns.$inferSelect)["resultJson"],
+): boolean {
+  return parseObject(resultJson)[PROVIDER_EXHAUSTED_RESULT_FLAG] === true;
+}
+
+// Compute the resultJson patch that records a provider-exhaustion marker for a
+// failed adapter run, or null when the failure is not an identifiable exhaustion.
+// Persisting the marker at finalize means the cascade decision can detect the
+// exhaustion from data that lives ON the run's resultJson — it does not depend on
+// the in-memory `.error` field, which is not reliably populated when the failover
+// decision runs inline at run-finalize. Scoped to the transient_upstream family so
+// ordinary failures (and brief 429 blips carrying no exhaustion message) are left
+// untouched.
+export function providerExhaustionResultJsonPatch(input: {
+  errorCode: string | null | undefined;
+  errorMessage: string | null | undefined;
+  resultJson?: Record<string, unknown> | null;
+}): { providerExhausted: true } | null {
+  const family = readHeartbeatRunErrorFamily({
+    errorCode: input.errorCode ?? null,
+    resultJson: input.resultJson ?? null,
+  });
+  if (family !== "transient_upstream" && family !== "provider_quota") return null;
+  return messageIndicatesProviderExhaustion(input.errorMessage) ? { providerExhausted: true } : null;
+}
+
+export function isProviderExhaustionFailover(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson"> & {
+    error?: string | null;
+  },
+): boolean {
+  // Usage / credit / rate-limit exhaustion surfaces under the transient_upstream
+  // family. It IDEALLY carries a reset window (retryNotBefore) — "blocked until
+  // <time>" — and failing over to the next provider beats waiting for that reset,
+  // which can be hours away. But not every adapter populates a reset window
+  // (codex_local on a "purchase more credits" wall sets none), so also fail over
+  // when a durable exhaustion marker was persisted at finalize, or — as a
+  // secondary signal — the raw error message positively identifies a genuine
+  // exhaustion. A transient_upstream that is only a brief 429 blip (no reset
+  // window, no marker, no exhaustion signature) is intentionally left to the quick
+  // same-provider retry.
+  const transient = readTransientRecoveryContractFromRun(run);
+  if (transient) {
+    if (transient.retryNotBefore != null) return true;
+    if (readProviderExhaustedFlag(run.resultJson)) return true;
+    if (messageIndicatesProviderExhaustion(run.error)) return true;
+  }
+  // An auth wall (expired/absent login) will not clear on its own.
+  return run.errorCode === "claude_auth_required";
+}
+
+export interface ProviderCascadeOverride {
+  entryIndex: number;
+  adapterType: string;
+  adapterConfig: Record<string, unknown>;
+}
+
+export function parseProviderCascadeOverride(value: unknown): ProviderCascadeOverride | null {
+  const override = parseObject(value);
+  const adapterType = readNonEmptyString(override.adapterType);
+  if (!adapterType) return null;
+  const entryIndex = asNumber(override.entryIndex, -1);
+  if (!Number.isInteger(entryIndex) || entryIndex < 0) return null;
+  return { entryIndex, adapterType, adapterConfig: parseObject(override.adapterConfig) };
+}
 function mergeAdapterRecoveryMetadata(input: {
   resultJson: Record<string, unknown> | null | undefined;
   errorFamily?: string | null;

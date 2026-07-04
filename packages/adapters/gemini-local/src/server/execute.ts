@@ -51,6 +51,8 @@ import { DEFAULT_GEMINI_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js
 import {
   describeGeminiFailure,
   detectGeminiAuthRequired,
+  detectGeminiQuotaExhausted,
+  extractGeminiQuotaRetryNotBefore,
   isGeminiTransientNetworkError,
   isGeminiTurnLimitResult,
   isGeminiSessionUnrecoverableError,
@@ -654,6 +656,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       attempt.proc.exitCode,
     );
 
+    // Quota exhaustion is provider exhaustion: classify it transient_upstream
+    // (with the parsed reset window when the CLI reports one) so the
+    // provider-cascade failover can move the run to the next provider instead
+    // of dead-waiting hours for the quota to reset.
+    const quotaMeta = failed && !authMeta.requiresAuth
+      ? detectGeminiQuotaExhausted({
+          parsed: attempt.parsed.resultEvent,
+          stdout: attempt.proc.stdout,
+          stderr: attempt.proc.stderr,
+        })
+      : { exhausted: false };
+    const quotaRetryNotBefore = quotaMeta.exhausted
+      ? extractGeminiQuotaRetryNotBefore({
+          parsed: attempt.parsed.resultEvent,
+          stdout: attempt.proc.stdout,
+          stderr: attempt.proc.stderr,
+        })
+      : null;
+
     // On retry, don't fall back to old session ID — the old session was stale
     const canFallbackToRuntimeSession = !isRetry;
     const resolvedSessionId = attempt.parsed.sessionId
@@ -678,6 +699,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         stderr: attempt.proc.stderr,
       }),
       ...(failed && clearSessionForTurnLimit ? { stopReason: "max_turns_exhausted" } : {}),
+      ...(quotaMeta.exhausted ? { errorFamily: "transient_upstream" } : {}),
+      ...(quotaRetryNotBefore
+        ? {
+            retryNotBefore: quotaRetryNotBefore.toISOString(),
+            transientRetryNotBefore: quotaRetryNotBefore.toISOString(),
+          }
+        : {}),
     };
 
     return {
@@ -692,6 +720,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : failed && networkUnavailable
         ? "gemini_network_unavailable"
         : null,
+      errorFamily: quotaMeta.exhausted ? "transient_upstream" : null,
+      retryNotBefore: quotaRetryNotBefore ? quotaRetryNotBefore.toISOString() : null,
       usage: attempt.parsed.usage,
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,

@@ -9,7 +9,12 @@ const CODEX_TRANSIENT_UPSTREAM_RE =
   /(?:we(?:'|’)re\s+currently\s+experiencing\s+high\s+demand|temporary\s+errors|rate[-\s]?limit(?:ed)?|too\s+many\s+requests|\b429\b|server\s+overloaded|service\s+unavailable|try\s+again\s+later)/i;
 const CODEX_REMOTE_COMPACTION_RE = /remote\s+compact\s+task/i;
 const CODEX_USAGE_LIMIT_RE =
-  /you(?:'|’)ve hit your usage limit for .+\.\s+switch to another model now,\s+or try again at\s+([^.!\n]+)(?:[.!]|\n|$)/i;
+  /you(?:'|’)ve hit your usage limit\b[\s\S]{0,200}?\btry again at\s+([^.!\n]+)(?:[.!]|\n|$)/i;
+// Bare usage-limit signature, independent of whether a reset time is present or
+// parseable. The CLI's wording drifts ("try again at 9:47 PM" vs "try again at
+// Jul 6th, 2026 9:47 PM" vs future variants); the wall itself is what matters
+// for classifying the failure as provider exhaustion.
+const CODEX_USAGE_LIMIT_SIGNATURE_RE = /you(?:'|’)ve hit your usage limit/i;
 const CODEX_PROVIDER_QUOTA_RE =
   /(?:you(?:'|’)ve hit your usage limit|usage limit|model (?:is )?at capacity|at capacity for this model|capacity limit)/i;
 
@@ -236,6 +241,17 @@ function parseLocalClockTime(clockText: string, now: Date): Date | null {
   return retryAt;
 }
 
+// Absolute-date reset variant: "try again at Jul 6th, 2026 9:47 PM". Strip the
+// ordinal suffix ("6th" -> "6") so Date.parse accepts it, and only trust results
+// that land in the future — Date.parse on arbitrary text is too permissive to
+// accept unvalidated.
+function parseAbsoluteResetDate(text: string, now: Date): Date | null {
+  const normalized = text.trim().replace(/(\d{1,2})(st|nd|rd|th)\b/gi, "$1");
+  const parsed = new Date(normalized);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.getTime() > now.getTime() ? parsed : null;
+}
+
 export function extractCodexRetryNotBefore(input: {
   stdout?: string | null;
   stderr?: string | null;
@@ -244,7 +260,8 @@ export function extractCodexRetryNotBefore(input: {
   const haystack = buildCodexErrorHaystack(input);
   const usageLimitMatch = haystack.match(CODEX_USAGE_LIMIT_RE);
   if (!usageLimitMatch) return null;
-  return parseLocalClockTime(usageLimitMatch[1] ?? "", now);
+  const resetText = usageLimitMatch[1] ?? "";
+  return parseLocalClockTime(resetText, now) ?? parseAbsoluteResetDate(resetText, now);
 }
 
 export function isCodexTransientUpstreamError(input: {
@@ -255,9 +272,14 @@ export function isCodexTransientUpstreamError(input: {
   const haystack = buildCodexErrorHaystack(input);
 
   if (isCodexProviderQuotaError(input)) return false;
+  if (extractCodexRetryNotBefore(input) != null) return true;
+  // A usage-limit wall is provider exhaustion even when its reset time is
+  // missing or unparseable (the CLI's time wording drifts across versions).
+  if (CODEX_USAGE_LIMIT_SIGNATURE_RE.test(haystack)) return true;
   if (!CODEX_TRANSIENT_UPSTREAM_RE.test(haystack)) return false;
   // Keep automatic retries scoped to the observed remote-compaction/high-demand
-  // failure shape.
+  // failure shape, plus explicit usage-limit windows that tell us when retrying
+  // becomes safe again.
   return CODEX_REMOTE_COMPACTION_RE.test(haystack) || /high\s+demand|temporary\s+errors/i.test(haystack);
 }
 
