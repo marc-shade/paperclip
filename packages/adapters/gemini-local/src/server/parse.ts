@@ -299,6 +299,30 @@ export function detectGeminiQuotaExhausted(input: {
   return { exhausted };
 }
 
+// The Gemini CLI's TerminalQuotaError reports a relative reset window:
+// "You have exhausted your capacity on this model. Your quota will reset after
+// 18h32m3s." Parse the duration into an absolute retry-not-before instant so
+// the provider-cascade decision can fail over instead of dead-waiting.
+const GEMINI_QUOTA_RESET_AFTER_RE =
+  /quota will reset after\s+(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?/i;
+
+export function extractGeminiQuotaRetryNotBefore(input: {
+  parsed: Record<string, unknown> | null;
+  stdout: string;
+  stderr: string;
+}, now = new Date()): Date | null {
+  const errors = extractGeminiErrorMessages(input.parsed ?? {});
+  const haystack = [...errors, input.stdout, input.stderr].join("\n");
+  const match = haystack.match(GEMINI_QUOTA_RESET_AFTER_RE);
+  if (!match) return null;
+  const hours = Number.parseInt(match[1] ?? "0", 10);
+  const minutes = Number.parseInt(match[2] ?? "0", 10);
+  const seconds = Number.parseInt(match[3] ?? "0", 10);
+  const totalMs = ((hours * 60 + minutes) * 60 + seconds) * 1000;
+  if (totalMs <= 0) return null;
+  return new Date(now.getTime() + totalMs);
+}
+
 export function isGeminiTurnLimitResult(
   parsed: Record<string, unknown> | null | undefined,
   exitCode?: number | null,

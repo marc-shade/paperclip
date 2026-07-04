@@ -458,7 +458,7 @@ export function readEnabledProviderCascadeEntries(
 // can fail over to the next provider instead of dead-waiting for the exhausted
 // provider's quota to reset hours later.
 const PROVIDER_EXHAUSTION_ERROR_SIGNATURE =
-  /usage limit|purchase more credits|hit your usage|out of credits?|quota (?:exceeded|reached)|insufficient (?:credit|quota|balance)|upgrade to pro|billing (?:hard )?limit/i;
+  /usage limit|purchase more credits|hit your usage|out of credits?|quota (?:exceeded|reached)|quota will reset|exhausted your capacity|insufficient (?:credit|quota|balance)|upgrade to pro|billing (?:hard )?limit/i;
 
 // resultJson key for the durable exhaustion marker persisted at run-finalize.
 const PROVIDER_EXHAUSTED_RESULT_FLAG = "providerExhausted";

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   detectGeminiAuthRequired,
+  detectGeminiQuotaExhausted,
+  extractGeminiQuotaRetryNotBefore,
   isGeminiTransientNetworkError,
   isGeminiSessionUnrecoverableError,
   parseGeminiJsonl,
@@ -211,5 +213,44 @@ describe("isGeminiTransientNetworkError", () => {
     expect(
       isGeminiTransientNetworkError("", "Error: unknown session 'abc-123'"),
     ).toBe(false);
+  });
+});
+
+describe("gemini quota exhaustion classification", () => {
+  // Live TerminalQuotaError observed 2026-07-04 (gemini CLI v0.47).
+  const quotaStderr =
+    "Error when talking to Gemini API Full report available at: /tmp/gemini-client-error-Turn.run-sendMessageStream.json " +
+    "TerminalQuotaError: You have exhausted your capacity on this model. Your quota will reset after 18h32m3s.";
+
+  it("detects TerminalQuotaError as quota exhaustion", () => {
+    expect(
+      detectGeminiQuotaExhausted({ parsed: null, stdout: "", stderr: quotaStderr }).exhausted,
+    ).toBe(true);
+  });
+
+  it("extracts the relative reset window into an absolute retry-not-before", () => {
+    const now = new Date("2026-07-04T21:41:09.000Z");
+    expect(
+      extractGeminiQuotaRetryNotBefore({ parsed: null, stdout: "", stderr: quotaStderr }, now)?.toISOString(),
+    ).toBe("2026-07-05T16:13:12.000Z");
+  });
+
+  it("handles partial durations (minutes+seconds only)", () => {
+    const now = new Date("2026-07-04T00:00:00.000Z");
+    expect(
+      extractGeminiQuotaRetryNotBefore(
+        { parsed: null, stdout: "", stderr: "Your quota will reset after 27m47s." },
+        now,
+      )?.toISOString(),
+    ).toBe("2026-07-04T00:27:47.000Z");
+  });
+
+  it("returns null when no reset window is present", () => {
+    expect(
+      extractGeminiQuotaRetryNotBefore(
+        { parsed: null, stdout: "", stderr: "You have exhausted your capacity on this model." },
+        new Date(),
+      ),
+    ).toBe(null);
   });
 });

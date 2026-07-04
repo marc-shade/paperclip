@@ -127,6 +127,29 @@ describe("isCodexTransientUpstreamError", () => {
     );
   });
 
+  it("classifies date-bearing usage-limit resets and extracts the retry date", () => {
+    // Live spark-exhaustion message observed 2026-07-04: the reset is a full
+    // date ("Jul 6th, 2026 9:47 PM"), not a bare clock time. Before the
+    // absolute-date fallback this returned null and the run never cascaded.
+    const errorMessage =
+      "You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at Jul 6th, 2026 9:47 PM.";
+    const now = new Date(2026, 6, 4, 21, 0, 0);
+
+    expect(isCodexTransientUpstreamError({ errorMessage })).toBe(true);
+    expect(extractCodexRetryNotBefore({ errorMessage }, now)?.getTime()).toBe(
+      new Date(2026, 6, 6, 21, 47, 0, 0).getTime(),
+    );
+  });
+
+  it("classifies usage-limit walls with no parseable reset time as transient upstream", () => {
+    expect(
+      isCodexTransientUpstreamError({
+        errorMessage:
+          "You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now.",
+      }),
+    ).toBe(true);
+  });
+
   it("parses explicit timezone hints on usage-limit retry windows", () => {
     const errorMessage = "You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at 11:31 PM (America/Chicago).";
     const now = new Date("2026-04-23T03:29:02.000Z");
