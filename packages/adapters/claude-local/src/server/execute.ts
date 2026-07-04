@@ -906,7 +906,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // successful run to Paperclip and the heartbeat stalls silently. See RY-604.
     const claudeRefusal = isClaudeRefusalResult(parsed);
     const parsedIsError = asBoolean(parsed.is_error, false);
-    const failed = (proc.exitCode ?? 0) !== 0 || parsedIsError;
+    // A `result` event with subtype=success and is_error=false is the CLI's own
+    // terminal verdict for the turn — the work is complete by the time it is
+    // emitted. Sessions that leave background children behind (armed monitors,
+    // orphaned pipes) can make the *process* exit non-zero after that verdict;
+    // grading those runs failed re-runs an already-completed tick and pollutes
+    // failure metrics (recurring on monitor-arming agent sessions). Trust the
+    // result event over the exit code; is_error=true still fails.
+    const completedSuccessfully =
+      asString(parsed.subtype, "") === "success" && !parsedIsError;
+    const failed = !completedSuccessfully && ((proc.exitCode ?? 0) !== 0 || parsedIsError);
     // Validate-before-persist guard: never persist a sessionId whose transcript
     // is known-poisoned. The Claude CLI keeps an on-disk JSONL keyed by the
     // session id; if the last entry contains a non-`msg_`-prefixed
@@ -964,6 +973,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : claudeRefusal
       ? "claude_refusal"
       : null;
+    // The run-finalize site grades success as `exitCode === 0 && !errorMessage`,
+    // so a trusted subtype=success verdict must also normalize the reported exit
+    // code. Preserve the raw process exit code in resultJson for forensics.
+    const exitCodeOverridden = completedSuccessfully && (proc.exitCode ?? 0) !== 0;
     const mergedResultJson: Record<string, unknown> = {
       ...parsed,
       ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
@@ -972,10 +985,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
       ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
+      ...(exitCodeOverridden ? { processExitCode: proc.exitCode } : {}),
     };
 
     return {
-      exitCode: proc.exitCode,
+      exitCode: exitCodeOverridden ? 0 : proc.exitCode,
       signal: proc.signal,
       timedOut: false,
       errorMessage,
