@@ -17,6 +17,19 @@ test("resolveHermesCommand falls back to command before default hermes binary", 
   expect(resolveHermesCommand({})).toBe(HERMES_CLI);
 });
 
+// Paperclip keeps adapter_config keys when the adapter type is switched, so a
+// leftover `command` from another adapter (e.g. claude_local's "claude") must
+// not be spawned with hermes args (KIN-752: `error: unknown option '-q'`).
+test("resolveHermesCommand ignores a command leftover from another adapter", () => {
+  expect(resolveHermesCommand({ command: "claude" })).toBe(HERMES_CLI);
+  expect(resolveHermesCommand({ command: "/usr/local/bin/codex" })).toBe(HERMES_CLI);
+  expect(resolveHermesCommand({ command: "Claude" })).toBe(HERMES_CLI);
+  // …but an explicit hermesCommand always wins, even if it names another CLI.
+  expect(resolveHermesCommand({ hermesCommand: "claude", command: "hermes" })).toBe("claude");
+  // Custom hermes wrappers and absolute paths still pass through `command`.
+  expect(resolveHermesCommand({ command: "/opt/hermes/bin/hermes" })).toBe("/opt/hermes/bin/hermes");
+});
+
 test("testEnvironment accepts config.command when hermesCommand is absent", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-command-resolution-"));
   const cliPath = path.join(tempDir, "fake-hermes");
