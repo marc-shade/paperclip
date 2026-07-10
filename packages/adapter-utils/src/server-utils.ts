@@ -2974,6 +2974,13 @@ export async function runChildProcess(
 
         const stdin = child.stdin;
         if (opts.stdin != null && stdin) {
+          // The killed/destroyed guard below races with child exit: a buffered
+          // write can still raise EPIPE as an 'error' event on the stdin
+          // socket, which is fatal to the whole process when unhandled. The
+          // child's own exit path reports the real outcome.
+          stdin.on("error", (err: Error) => {
+            onLogError(err, runId, "failed to write adapter stdin");
+          });
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
             stdin.write(opts.stdin as string);

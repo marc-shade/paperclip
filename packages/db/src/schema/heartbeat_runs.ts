@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import { type AnyPgColumn, pgTable, uuid, text, timestamp, jsonb, index, integer, bigint, boolean } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
@@ -83,6 +84,47 @@ export const heartbeatRuns = pgTable(
       table.companyId,
       table.status,
       table.processStartedAt,
+    ),
+    // Expression indexes over context_snapshot lookups. Without these, every
+    // issueId/taskId/taskKey lookup de-TOASTs context_snapshot for all of the
+    // scanned rows (the TOAST for this table dwarfs the heap), which is enough
+    // to saturate the database under normal heartbeat traffic.
+    ctxIssueIdExprIdx: index("heartbeat_runs_ctx_issueid_expr_idx").on(
+      table.companyId,
+      table.agentId,
+      sql`(${table.contextSnapshot}->>'issueId')`,
+    ),
+    ctxTaskIdExprIdx: index("heartbeat_runs_ctx_taskid_expr_idx").on(
+      table.companyId,
+      table.agentId,
+      sql`(${table.contextSnapshot}->>'taskId')`,
+    ),
+    ctxTaskKeyExprIdx: index("heartbeat_runs_ctx_taskkey_expr_idx").on(
+      table.companyId,
+      table.agentId,
+      sql`(${table.contextSnapshot}->>'taskKey')`,
+    ),
+    // Agent-less variants for the watchdog/recovery paths that filter by
+    // company + status + context_snapshot only.
+    companyCtxIssueIdExprIdx: index("heartbeat_runs_company_ctx_issueid_expr_idx").on(
+      table.companyId,
+      sql`(${table.contextSnapshot}->>'issueId')`,
+    ),
+    companyCtxTaskIdExprIdx: index("heartbeat_runs_company_ctx_taskid_expr_idx").on(
+      table.companyId,
+      sql`(${table.contextSnapshot}->>'taskId')`,
+    ),
+    companyCtxTaskKeyExprIdx: index("heartbeat_runs_company_ctx_taskkey_expr_idx").on(
+      table.companyId,
+      sql`(${table.contextSnapshot}->>'taskKey')`,
+    ),
+    // Ordered listing (`order by created_at desc limit N` per company). Without
+    // it the run-listing endpoints sort the whole table and evaluate their
+    // context_snapshot projections below the Sort node — a full-table de-TOAST
+    // on every call.
+    companyCreatedIdx: index("heartbeat_runs_company_created_idx").on(
+      table.companyId,
+      table.createdAt.desc(),
     ),
   }),
 );

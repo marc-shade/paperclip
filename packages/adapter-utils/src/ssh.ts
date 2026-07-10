@@ -316,6 +316,13 @@ async function spawnText(
     });
 
     if (options.stdin != null && child.stdin) {
+      // If the child exits before consuming stdin, the buffered write raises
+      // EPIPE as an 'error' event on the stdin socket, which is fatal to the
+      // whole process when unhandled. Fold it into stderr so the close
+      // handler's exit-code path reports it instead.
+      child.stdin.on("error", (error: Error) => {
+        append("stderr", `stdin write failed: ${error.message}\n`);
+      });
       child.stdin.end(options.stdin);
     }
   });
@@ -679,6 +686,10 @@ async function streamLocalFileToSsh(input: {
     });
     source.on("error", fail);
     ssh.on("error", fail);
+    // pipe() does not forward errors: if ssh exits mid-transfer, the buffered
+    // write to its stdin raises EPIPE as an 'error' event on the stdin socket,
+    // which is fatal to the whole process when unhandled.
+    ssh.stdin?.on("error", fail);
     if (input.progress) {
       input.progress.counter.on("error", fail);
       source.pipe(input.progress.counter).pipe(ssh.stdin ?? null);
@@ -729,6 +740,9 @@ async function streamSshToLocalFile(input: {
       reject(error);
     };
 
+    // pipe() does not forward errors: an unhandled 'error' on the stdout
+    // socket is fatal to the whole process.
+    ssh.stdout?.on("error", fail);
     if (input.progress) {
       input.progress.counter.on("error", fail);
       ssh.stdout?.pipe(input.progress.counter).pipe(sink);
@@ -1339,6 +1353,12 @@ export async function syncDirectoryToSsh(input: {
       reject(error);
     };
 
+    // pipe() does not forward errors: if ssh exits mid-transfer, the buffered
+    // write to its stdin raises EPIPE as an 'error' event on the stdin socket,
+    // which is fatal to the whole process when unhandled. Same for a read
+    // error on tar's stdout.
+    ssh.stdin?.on("error", fail);
+    tar.stdout?.on("error", fail);
     if (progress) {
       progress.counter.on("error", fail);
       tar.stdout?.pipe(progress.counter).pipe(ssh.stdin ?? null);
