@@ -1,7 +1,7 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { INBOX_MINE_ISSUE_STATUS_FILTER } from "@paperclipai/shared";
+import { deriveOriginatingActor, INBOX_MINE_ISSUE_STATUS_FILTER } from "@paperclipai/shared";
 import { approvalsApi } from "../api/approvals";
 import { accessApi } from "../api/access";
 import { authApi } from "../api/auth";
@@ -53,6 +53,14 @@ import {
   resolveInboxIssueBlockerAttention,
   resolveIssueLiveDescendantCount,
 } from "../lib/inbox-live-descendants";
+import {
+  cancelInboxIssueQueries,
+  invalidateInboxIssueQueries,
+  removeIssueFromInboxCaches,
+  restoreIssueToInboxCaches,
+  snapshotInboxIssueCaches,
+  type InboxIssueCacheSnapshot,
+} from "../lib/inboxArchiveCache";
 import { EmptyState } from "../components/EmptyState";
 import { IssueGroupHeader } from "../components/IssueGroupHeader";
 import { PageSkeleton } from "../components/PageSkeleton";
@@ -343,7 +351,7 @@ export function FailedRunInboxRow({
             <span className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
               <StatusBadge status={run.status} />
               {linkedAgentName && issue ? <span>{linkedAgentName}</span> : null}
-              <span className="truncate max-w-[300px]">{displayError}</span>
+              <span className="truncate max-w-(--sz-300px)">{displayError}</span>
               <span>{timeAgo(run.createdAt)}</span>
             </span>
           </span>
@@ -1529,12 +1537,9 @@ export function Inbox() {
   const [selectedIndex, setSelectedIndex] = useState<number>(-1);
   const listRef = useRef<HTMLDivElement>(null);
 
-  const invalidateInboxIssueQueries = () => {
+  const invalidateInboxIssueQueryCaches = () => {
     if (!selectedCompanyId) return;
-    queryClient.invalidateQueries({ queryKey: queryKeys.issues.listMineByMe(selectedCompanyId) });
-    queryClient.invalidateQueries({ queryKey: queryKeys.issues.listTouchedByMe(selectedCompanyId) });
-    queryClient.invalidateQueries({ queryKey: queryKeys.issues.listUnreadTouchedByMe(selectedCompanyId) });
-    queryClient.invalidateQueries({ queryKey: queryKeys.sidebarBadges(selectedCompanyId) });
+    invalidateInboxIssueQueries(queryClient, selectedCompanyId);
   };
 
   const archiveIssueMutation = useMutation({
@@ -1543,24 +1548,11 @@ export function Inbox() {
       setActionError(null);
       setArchivingIssueIds((prev) => new Set(prev).add(id));
 
-      // Cancel in-flight refetches so they don't overwrite our optimistic update
-      const queryKeys_ = [
-        [...queryKeys.issues.listMineByMe(selectedCompanyId!), "with-routine-executions"],
-        [...queryKeys.issues.listTouchedByMe(selectedCompanyId!), "with-routine-executions"],
-        queryKeys.issues.listUnreadTouchedByMe(selectedCompanyId!),
-      ];
-      await Promise.all(queryKeys_.map((qk) => queryClient.cancelQueries({ queryKey: qk })));
+      if (!selectedCompanyId) return { previousData: [] as InboxIssueCacheSnapshot };
 
-      // Snapshot previous data for rollback
-      const previousData = queryKeys_.map((qk) => [qk, queryClient.getQueryData(qk)] as const);
-
-      // Optimistically remove the issue from all inbox query caches
-      for (const qk of queryKeys_) {
-        queryClient.setQueryData(qk, (old: unknown) => {
-          if (!Array.isArray(old)) return old;
-          return old.filter((issue: { id: string }) => issue.id !== id);
-        });
-      }
+      await cancelInboxIssueQueries(queryClient, selectedCompanyId);
+      const previousData = snapshotInboxIssueCaches(queryClient, selectedCompanyId);
+      removeIssueFromInboxCaches(queryClient, selectedCompanyId, id);
 
       return { previousData };
     },
@@ -1571,11 +1563,9 @@ export function Inbox() {
         next.delete(id);
         return next;
       });
-      // Restore previous query data on failure
+      // Restore only this failed archive so overlapping archive mutations stay removed.
       if (context?.previousData) {
-        for (const [qk, data] of context.previousData) {
-          queryClient.setQueryData(qk, data);
-        }
+        restoreIssueToInboxCaches(queryClient, context.previousData, id);
       }
     },
     onSettled: (_data, _error, id) => {
@@ -1585,7 +1575,7 @@ export function Inbox() {
         next.delete(id);
         return next;
       });
-      invalidateInboxIssueQueries();
+      invalidateInboxIssueQueryCaches();
     },
     onSuccess: (_data, id) => {
       setUndoableArchiveIssueIds((prev) => [...prev.filter((issueId) => issueId !== id), id]);
@@ -1613,7 +1603,7 @@ export function Inbox() {
         next.delete(id);
         return next;
       });
-      invalidateInboxIssueQueries();
+      invalidateInboxIssueQueryCaches();
     },
   });
 
@@ -1623,7 +1613,7 @@ export function Inbox() {
       setFadingOutIssues((prev) => new Set(prev).add(id));
     },
     onSuccess: () => {
-      invalidateInboxIssueQueries();
+      invalidateInboxIssueQueryCaches();
     },
     onSettled: (_data, _error, id) => {
       setTimeout(() => {
@@ -1648,7 +1638,7 @@ export function Inbox() {
       });
     },
     onSuccess: () => {
-      invalidateInboxIssueQueries();
+      invalidateInboxIssueQueryCaches();
     },
     onSettled: (_data, _error, issueIds) => {
       setTimeout(() => {
@@ -1664,7 +1654,7 @@ export function Inbox() {
   const markUnreadMutation = useMutation({
     mutationFn: (id: string) => issuesApi.markUnread(id),
     onSuccess: () => {
-      invalidateInboxIssueQueries();
+      invalidateInboxIssueQueryCaches();
     },
   });
 
@@ -2062,7 +2052,7 @@ export function Inbox() {
                   e.currentTarget.blur();
                 }
               }}
-              className="h-8 w-[220px] pl-8 text-xs"
+              className="h-8 w-(--sz-220px) pl-8 text-xs"
               data-page-search-target="true"
             />
           </div>
@@ -2198,7 +2188,7 @@ export function Inbox() {
                     {([
                       ["none", "None"],
                       ["type", "Type"],
-                      ["assignee", "Assignee"],
+                      ["assignee", "Responsible"],
                       ["project", "Project"],
                       ...(isolatedWorkspacesEnabled ? ([["workspace", "Workspace"]] as const) : []),
                     ] as const).map(([value, label]) => (
@@ -2275,7 +2265,7 @@ export function Inbox() {
             value={allCategoryFilter}
             onValueChange={(value) => updateAllCategoryFilter(value as InboxCategoryFilter)}
           >
-            <SelectTrigger className="h-8 w-[170px] text-xs">
+            <SelectTrigger className="h-8 w-(--sz-170px) text-xs">
               <SelectValue placeholder="Category" />
             </SelectTrigger>
             <SelectContent>
@@ -2293,7 +2283,7 @@ export function Inbox() {
               value={allApprovalFilter}
               onValueChange={(value) => updateAllApprovalFilter(value as InboxApprovalFilter)}
             >
-              <SelectTrigger className="h-8 w-[170px] text-xs">
+              <SelectTrigger className="h-8 w-(--sz-170px) text-xs">
                 <SelectValue placeholder="Approval status" />
               </SelectTrigger>
               <SelectContent>
@@ -2382,6 +2372,10 @@ export function Inbox() {
                   const assigneeUserProfile = issue.assigneeUserId
                     ? companyUserProfileMap.get(issue.assigneeUserId) ?? null
                     : null;
+                  const originatingActor = deriveOriginatingActor(issue);
+                  const originatingUserId = originatingActor?.kind === "user" ? originatingActor.id : null;
+                  const originatingViaAgentId =
+                    originatingActor?.kind === "user" ? originatingActor.viaAgentId ?? null : null;
                   const isLive = liveIssueIds.has(issue.id);
                   const loadedSubtreeLiveCount = subtreeLiveCounts.get(issue.id) ?? 0;
                   const liveDescendantCount = resolveIssueLiveDescendantCount(issue, loadedSubtreeLiveCount);
@@ -2407,7 +2401,7 @@ export function Inbox() {
                       selected={selected}
                       className={
                         isArchiving
-                          ? "pointer-events-none -translate-x-4 scale-[0.98] opacity-0 transition-all duration-200 ease-out"
+                          ? "pointer-events-none -translate-x-4 scale-(--s-0_98) opacity-0 transition-all duration-200 ease-out"
                           : "transition-all duration-200 ease-out"
                       }
                       desktopMetaLeading={
@@ -2468,7 +2462,7 @@ export function Inbox() {
                       unreadState={isUnread ? "visible" : isFading ? "fading" : "hidden"}
                       onMarkRead={() => markReadMutation.mutate(issue.id)}
                       onArchive={allowArchive ? () => archiveIssueMutation.mutate(issue.id) : undefined}
-                      archiveDisabled={isArchiving || archiveIssueMutation.isPending}
+                      archiveDisabled={isArchiving}
                       desktopTrailing={
                         visibleTrailingIssueColumns.length > 0 ? (
                           <InboxIssueTrailingColumns
@@ -2488,6 +2482,10 @@ export function Inbox() {
                               ?? null
                             }
                             assigneeUserAvatarUrl={assigneeUserProfile?.image ?? null}
+                            creatorAgentName={agentName(issue.createdByAgentId)}
+                            creatorUserName={originatingUserId ? (companyUserProfileMap.get(originatingUserId)?.label ?? null) : null}
+                            creatorUserAvatarUrl={originatingUserId ? (companyUserProfileMap.get(originatingUserId)?.image ?? null) : null}
+                            viaAgentName={originatingViaAgentId ? agentName(originatingViaAgentId) : null}
                             currentUserId={currentUserId}
                             parentIdentifier={issue.parentId ? (issueById.get(issue.parentId)?.identifier ?? null) : null}
                             parentTitle={issue.parentId ? (issueById.get(issue.parentId)?.title ?? null) : null}
@@ -2512,7 +2510,7 @@ export function Inbox() {
                         className="flex items-center gap-3 border-y border-border/70 bg-muted/30 px-4 py-2"
                       >
                         <div className="h-px flex-1 bg-border/80" />
-                        <span className="shrink-0 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                        <span className="shrink-0 text-(length:--text-micro) font-semibold uppercase tracking-wide text-muted-foreground">
                           {group.searchSection === "archived" ? "Archived" : "Other results"}
                         </span>
                         <div className="h-px flex-1 bg-border/80" />
@@ -2590,7 +2588,7 @@ export function Inbox() {
                       elements.push(
                         <div key={`today-divider-${group.key}-${index}`} className="my-2 flex items-center gap-3 px-4">
                           <div className="flex-1 border-t border-zinc-600" />
-                          <span className="shrink-0 text-[11px] font-medium uppercase tracking-wider text-zinc-500">
+                          <span className="shrink-0 text-(length:--text-micro) font-medium uppercase tracking-wider text-zinc-500">
                             Earlier
                           </span>
                         </div>,
@@ -2616,7 +2614,7 @@ export function Inbox() {
                           archiveDisabled={isArchiving}
                           className={
                             isArchiving
-                              ? "pointer-events-none -translate-x-4 scale-[0.98] opacity-0 transition-all duration-200 ease-out"
+                              ? "pointer-events-none -translate-x-4 scale-(--s-0_98) opacity-0 transition-all duration-200 ease-out"
                               : "transition-all duration-200 ease-out"
                           }
                         />
@@ -2654,7 +2652,7 @@ export function Inbox() {
                           archiveDisabled={isArchiving}
                           className={
                             isArchiving
-                              ? "pointer-events-none -translate-x-4 scale-[0.98] opacity-0 transition-all duration-200 ease-out"
+                              ? "pointer-events-none -translate-x-4 scale-(--s-0_98) opacity-0 transition-all duration-200 ease-out"
                               : "transition-all duration-200 ease-out"
                           }
                         />
@@ -2689,7 +2687,7 @@ export function Inbox() {
                           archiveDisabled={isArchiving}
                           className={
                             isArchiving
-                              ? "pointer-events-none -translate-x-4 scale-[0.98] opacity-0 transition-all duration-200 ease-out"
+                              ? "pointer-events-none -translate-x-4 scale-(--s-0_98) opacity-0 transition-all duration-200 ease-out"
                               : "transition-all duration-200 ease-out"
                           }
                         />
@@ -2753,7 +2751,7 @@ export function Inbox() {
                               <SwipeToArchive
                                 key={`issue:${child.id}`}
                                 selected={isChildSelected}
-                                disabled={isChildArchiving || archiveIssueMutation.isPending}
+                                disabled={isChildArchiving}
                                 onArchive={() => archiveIssueMutation.mutate(child.id)}
                               >
                                 {childRow}
@@ -2781,7 +2779,7 @@ export function Inbox() {
                       <SwipeToArchive
                         key={`issue:${issue.id}`}
                         selected={isSelected}
-                        disabled={archivingIssueIds.has(issue.id) || archiveIssueMutation.isPending}
+                        disabled={archivingIssueIds.has(issue.id)}
                         onArchive={() => archiveIssueMutation.mutate(issue.id)}
                       >
                         {parentRow}

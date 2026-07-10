@@ -52,6 +52,11 @@ import {
   createSecretSchema,
   updateSecretSchema,
   rotateSecretSchema,
+  rotateUserSecretValueSchema,
+  createUserSecretDefinitionSchema,
+  updateUserSecretDefinitionSchema,
+  createUserSecretValueSchema,
+  updateUserSecretValueSchema,
   // Approval
   createApprovalSchema,
   resolveApprovalSchema,
@@ -67,13 +72,16 @@ import {
   // Sidebar
   upsertSidebarOrderPreferenceSchema,
   // Execution workspaces
+  reconcileExecutionWorkspaceBranchSchema,
   updateExecutionWorkspaceSchema,
   workspaceOverviewQuerySchema,
   workspaceRuntimeControlTargetSchema,
   // Environments
   createEnvironmentSchema,
   cancelEnvironmentCustomImageSetupSessionSchema,
+  createEnvironmentCustomImageTerminalSessionTokenSchema,
   environmentCustomImageSetupSessionSchema,
+  environmentCustomImageTerminalSessionTokenSchema,
   environmentCustomImageTemplateSchema,
   finishEnvironmentCustomImageSetupSessionSchema,
   updateEnvironmentSchema,
@@ -654,6 +662,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/members/{memberId}/archive",
   "PATCH /api/companies/{companyId}/members/{memberId}/permissions",
   "GET /api/companies/{companyId}/user-directory",
+  "POST /api/execution-workspaces/{id}/reconcile-branch",
   "GET /api/board-api-keys",
   "POST /api/board-api-keys",
   "DELETE /api/board-api-keys/{keyId}",
@@ -670,6 +679,16 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "DELETE /api/secret-provider-configs/{id}",
   "POST /api/secret-provider-configs/{id}/default",
   "POST /api/secret-provider-configs/{id}/health",
+  "GET /api/companies/{companyId}/user-secret-definitions",
+  "POST /api/companies/{companyId}/user-secret-definitions",
+  "PATCH /api/companies/{companyId}/user-secret-definitions/{definitionId}",
+  "DELETE /api/companies/{companyId}/user-secret-definitions/{definitionId}",
+  "GET /api/companies/{companyId}/user-secret-definitions/{definitionId}/coverage",
+  "GET /api/companies/{companyId}/me/user-secrets",
+  "POST /api/companies/{companyId}/me/user-secrets",
+  "PATCH /api/companies/{companyId}/me/user-secrets/{secretId}",
+  "POST /api/companies/{companyId}/me/user-secrets/{secretId}/rotate",
+  "DELETE /api/companies/{companyId}/me/user-secrets/{secretId}",
   "POST /api/companies/{companyId}/secrets/remote-import",
   "POST /api/companies/{companyId}/secrets/remote-import/preview",
   "GET /api/secrets/{id}/usage",
@@ -730,6 +749,8 @@ const CREATED_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/routines",
   "POST /api/routines/{id}/triggers",
   "POST /api/companies/{companyId}/secrets",
+  "POST /api/companies/{companyId}/user-secret-definitions",
+  "POST /api/companies/{companyId}/me/user-secrets",
   "POST /api/companies/{companyId}/skills",
   "POST /api/companies/{companyId}/skills/import",
   "POST /api/join-requests/{requestId}/claim-api-key",
@@ -861,6 +882,37 @@ registry.registerPath({
       deploymentMode: z.string().optional(),
       bootstrapStatus: z.enum(["ready", "bootstrap_pending"]).optional(),
       bootstrapInviteActive: z.boolean().optional(),
+      databaseBackup: z.object({
+        enabled: z.boolean(),
+        status: z.enum(["ok", "warning"]),
+        backupDir: z.string().optional(),
+        maxAgeHours: z.number().optional(),
+        latestBackup: z.object({
+          name: z.string(),
+          path: z.string(),
+          mtime: z.string().datetime(),
+          ageHours: z.number(),
+          sizeBytes: z.number(),
+        }).nullable().optional(),
+        lastFailure: z.object({
+          path: z.string(),
+          mtime: z.string().datetime(),
+          message: z.string(),
+        }).nullable().optional(),
+        warnings: z.array(z.object({
+          code: z.enum([
+            "database_backup_check_failed",
+            "database_backup_last_failure",
+            "database_backup_missing",
+            "database_backup_stale",
+          ]),
+          message: z.string(),
+        })),
+      }).optional(),
+      warnings: z.array(z.object({
+        code: z.string(),
+        message: z.string(),
+      })).optional(),
       serverInfo: z.object({
         processStartedAt: z.string().datetime(),
         git: z.union([
@@ -2254,6 +2306,111 @@ registry.registerPath({
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/user-secret-definitions",
+  tags: ["secrets"],
+  summary: "List user secret definitions",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/user-secret-definitions",
+  tags: ["secrets"],
+  summary: "Create a user secret definition",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(createUserSecretDefinitionSchema),
+  },
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/companies/{companyId}/user-secret-definitions/{definitionId}",
+  tags: ["secrets"],
+  summary: "Update a user secret definition",
+  request: {
+    params: z.object({ companyId: z.string(), definitionId: z.string() }),
+    body: jsonBody(updateUserSecretDefinitionSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/companies/{companyId}/user-secret-definitions/{definitionId}",
+  tags: ["secrets"],
+  summary: "Delete a user secret definition",
+  request: { params: z.object({ companyId: z.string(), definitionId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/user-secret-definitions/{definitionId}/coverage",
+  tags: ["secrets"],
+  summary: "Get user secret definition coverage",
+  request: { params: z.object({ companyId: z.string(), definitionId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/me/user-secrets",
+  tags: ["secrets"],
+  summary: "List my user secret values",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/me/user-secrets",
+  tags: ["secrets"],
+  summary: "Create my user secret value",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(createUserSecretValueSchema),
+  },
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/companies/{companyId}/me/user-secrets/{secretId}",
+  tags: ["secrets"],
+  summary: "Update my user secret value",
+  request: {
+    params: z.object({ companyId: z.string(), secretId: z.string() }),
+    body: jsonBody(updateUserSecretValueSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/me/user-secrets/{secretId}/rotate",
+  tags: ["secrets"],
+  summary: "Rotate my user secret value",
+  request: {
+    params: z.object({ companyId: z.string(), secretId: z.string() }),
+    body: jsonBody(rotateUserSecretValueSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/companies/{companyId}/me/user-secrets/{secretId}",
+  tags: ["secrets"],
+  summary: "Delete my user secret value",
+  request: { params: z.object({ companyId: z.string(), secretId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
 // ─── Approvals ───────────────────────────────────────────────────────────────
 
 registry.registerPath({
@@ -3471,6 +3628,18 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/execution-workspaces/{id}/reconcile-branch",
+  tags: ["execution-workspaces"],
+  summary: "Reconcile an execution workspace branch record",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(reconcileExecutionWorkspaceBranchSchema),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 422: r.unprocessable },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/execution-workspaces/{id}/runtime-services/{action}",
   tags: ["execution-workspaces"],
   summary: "Control a runtime service in a workspace",
@@ -3636,6 +3805,26 @@ registry.registerPath({
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/environment-custom-image-setup-sessions/{sessionId}/terminal-session-token",
+  tags: ["environments"],
+  summary: "Mint a short-lived terminal websocket token for a customImage SSH setup session",
+  request: {
+    params: z.object({ sessionId: z.string() }),
+    body: jsonBody(createEnvironmentCustomImageTerminalSessionTokenSchema),
+  },
+  responses: {
+    201: r.ok(environmentCustomImageTerminalSessionTokenSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
   },
 });
 
@@ -4810,6 +4999,27 @@ registerCurrentRoute({
   tags: ["routines"],
   summary: "Update a routine description annotation thread",
   body: updateDocumentAnnotationThreadSchema,
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/issues/{id}/diagnostics/blockers",
+  tags: ["issues"],
+  summary: "Get blocker diagnostics for an issue",
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/issues/{id}/diagnostics/wakes",
+  tags: ["issues"],
+  summary: "Get wake diagnostics for an issue",
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/issues/{id}/diagnostics/subtree",
+  tags: ["issues"],
+  summary: "Get bounded subtree wake and blocker diagnostics for an issue",
 });
 
 registerCurrentRoute({

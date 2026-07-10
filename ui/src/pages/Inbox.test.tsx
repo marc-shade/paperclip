@@ -23,6 +23,8 @@ const apiMocks = vi.hoisted(() => ({
   issuesList: vi.fn(),
   issuesCount: vi.fn(),
   issueLabels: vi.fn(),
+  archiveFromInbox: vi.fn(),
+  unarchiveFromInbox: vi.fn(),
   agentsList: vi.fn(),
   heartbeatRunsList: vi.fn(),
   liveRunsForCompany: vi.fn(),
@@ -64,8 +66,8 @@ vi.mock("../api/issues", () => ({
     listLabels: apiMocks.issueLabels,
     markRead: vi.fn(),
     markUnread: vi.fn(),
-    archiveFromInbox: vi.fn(),
-    unarchiveFromInbox: vi.fn(),
+    archiveFromInbox: apiMocks.archiveFromInbox,
+    unarchiveFromInbox: apiMocks.unarchiveFromInbox,
   },
 }));
 
@@ -166,6 +168,7 @@ function createIssue(overrides: Partial<Issue> = {}): Issue {
     priority: "medium",
     assigneeAgentId: null,
     assigneeUserId: null,
+    responsibleUserId: null,
     createdByAgentId: null,
     createdByUserId: null,
     issueNumber: 904,
@@ -194,6 +197,16 @@ function createIssue(overrides: Partial<Issue> = {}): Issue {
     ...overrides,
     workMode: overrides.workMode ?? "standard",
   };
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((innerResolve, innerReject) => {
+    resolve = innerResolve;
+    reject = innerReject;
+  });
+  return { promise, resolve, reject };
 }
 
 function createJoinRequest(
@@ -255,6 +268,8 @@ function resetInboxApiMocks() {
   apiMocks.issuesList.mockResolvedValue([]);
   apiMocks.issuesCount.mockResolvedValue({ count: 0 });
   apiMocks.issueLabels.mockResolvedValue([]);
+  apiMocks.archiveFromInbox.mockResolvedValue({ id: "issue-1", archivedAt: new Date() });
+  apiMocks.unarchiveFromInbox.mockResolvedValue({ id: "issue-1", archivedAt: new Date() });
   apiMocks.agentsList.mockResolvedValue([]);
   apiMocks.heartbeatRunsList.mockResolvedValue([]);
   apiMocks.liveRunsForCompany.mockResolvedValue([]);
@@ -424,6 +439,71 @@ describe("Inbox toolbar", () => {
       root.unmount();
     });
   });
+
+  it("keeps other issue archive controls enabled while one archive is pending", async () => {
+    routerMock.location.pathname = "/inbox/mine";
+    const issueA = createIssue({ id: "issue-a", identifier: "PAP-1001", title: "First inbox row" });
+    const issueB = createIssue({ id: "issue-b", identifier: "PAP-1002", title: "Second inbox row" });
+    apiMocks.issuesList.mockResolvedValue([issueA, issueB]);
+    const archiveA = createDeferred<{ id: string; archivedAt: Date }>();
+    apiMocks.archiveFromInbox.mockImplementation((id: string) =>
+      id === "issue-a" ? archiveA.promise : Promise.resolve({ id, archivedAt: new Date() }),
+    );
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0, gcTime: 0 } },
+    });
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <Inbox />
+        </QueryClientProvider>,
+      );
+    });
+    await vi.waitFor(() => {
+      expect(container.textContent).toContain("First inbox row");
+      expect(container.textContent).toContain("Second inbox row");
+    });
+
+    const initialArchiveButtons = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('button[aria-label="Dismiss from inbox"]'),
+    );
+    expect(initialArchiveButtons.length).toBeGreaterThanOrEqual(2);
+
+    await act(async () => {
+      initialArchiveButtons[0]!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+
+    await vi.waitFor(() => {
+      expect(apiMocks.archiveFromInbox).toHaveBeenCalledWith("issue-a");
+      expect(container.textContent).not.toContain("First inbox row");
+      expect(container.textContent).toContain("Second inbox row");
+    });
+
+    const remainingArchiveButton = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Dismiss from inbox"]',
+    );
+    expect(remainingArchiveButton).not.toBeNull();
+    expect(remainingArchiveButton?.disabled).toBe(false);
+
+    await act(async () => {
+      remainingArchiveButton!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+
+    await vi.waitFor(() => {
+      expect(apiMocks.archiveFromInbox).toHaveBeenCalledWith("issue-b");
+    });
+
+    await act(async () => {
+      archiveA.resolve({ id: "issue-a", archivedAt: new Date() });
+    });
+
+    act(() => {
+      root.unmount();
+    });
+  });
 });
 
 describe("FailedRunInboxRow", () => {
@@ -444,6 +524,7 @@ describe("FailedRunInboxRow", () => {
       id: "run-1",
       companyId: "company-1",
       agentId: "agent-1",
+      responsibleUserId: null,
       invocationSource: "assignment",
       triggerDetail: null,
       status: "failed",

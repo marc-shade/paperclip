@@ -6,8 +6,10 @@ import type {
   EnvironmentProbeResult,
   EnvironmentCustomImageSetupSession,
   EnvironmentCustomImageTemplate,
+  EnvironmentCustomImageTerminalSessionToken,
   FinishEnvironmentCustomImageSetupSession,
   StartEnvironmentCustomImageSetupSession,
+  CreateEnvironmentCustomImageTerminalSessionToken,
 } from "@paperclipai/shared";
 import { api } from "./client";
 
@@ -39,6 +41,10 @@ export interface EnvironmentCustomImageRollbackResult {
   supersededTemplate: EnvironmentCustomImageTemplate;
 }
 
+function customImageCompanyQuery(companyId: string): string {
+  return `companyId=${encodeURIComponent(companyId)}`;
+}
+
 export const environmentsApi = {
   list: (companyId: string) => api.get<Environment[]>(`/companies/${companyId}/environments`),
   capabilities: (companyId: string) =>
@@ -67,19 +73,30 @@ export const environmentsApi = {
     config?: Record<string, unknown>;
     metadata?: Record<string, unknown> | null;
   }) => api.post<EnvironmentProbeResult>(`/companies/${companyId}/environments/probe-config`, body),
-  customImageTemplate: (environmentId: string) =>
-    api.get<EnvironmentCustomImageOverview>(`/environments/${environmentId}/custom-image-template`),
+  customImageTemplate: (environmentId: string, companyId: string) =>
+    api.get<EnvironmentCustomImageOverview>(
+      `/environments/${environmentId}/custom-image-template?${customImageCompanyQuery(companyId)}`,
+    ),
   startCustomImageSetupSession: (
     environmentId: string,
+    companyId: string,
     body: StartEnvironmentCustomImageSetupSession = {},
   ) =>
     api.post<EnvironmentCustomImageSetupSessionResult>(
-      `/environments/${environmentId}/custom-image-setup-sessions`,
+      `/environments/${environmentId}/custom-image-setup-sessions?${customImageCompanyQuery(companyId)}`,
       body,
     ),
   customImageSetupSession: (sessionId: string) =>
     api.get<EnvironmentCustomImageSetupSessionResult>(
       `/environment-custom-image-setup-sessions/${sessionId}`,
+    ),
+  createCustomImageTerminalSessionToken: (
+    sessionId: string,
+    body: CreateEnvironmentCustomImageTerminalSessionToken = {},
+  ) =>
+    api.post<EnvironmentCustomImageTerminalSessionToken>(
+      `/environment-custom-image-setup-sessions/${sessionId}/terminal-session-token`,
+      body,
     ),
   finishCustomImageSetupSession: (
     sessionId: string,
@@ -97,16 +114,17 @@ export const environmentsApi = {
       `/environment-custom-image-setup-sessions/${sessionId}/cancel`,
       body,
     ),
-  rollbackCustomImageTemplate: (environmentId: string) =>
+  rollbackCustomImageTemplate: (environmentId: string, companyId: string) =>
     api.post<EnvironmentCustomImageRollbackResult>(
-      `/environments/${environmentId}/custom-image-template/rollback`,
+      `/environments/${environmentId}/custom-image-template/rollback?${customImageCompanyQuery(companyId)}`,
       {},
     ),
   disableCustomImageTemplate: (
     environmentId: string,
+    companyId: string,
     options: { deleteProviderTemplate?: boolean } = {},
   ) =>
     api.delete<EnvironmentCustomImageTemplate>(
-      `/environments/${environmentId}/custom-image-template?deleteProviderTemplate=${options.deleteProviderTemplate === true ? "true" : "false"}`,
+      `/environments/${environmentId}/custom-image-template?${customImageCompanyQuery(companyId)}&deleteProviderTemplate=${options.deleteProviderTemplate === true ? "true" : "false"}`,
     ),
 };

@@ -8,11 +8,6 @@ import {
 const CODEX_TRANSIENT_UPSTREAM_RE =
   /(?:we(?:'|’)re\s+currently\s+experiencing\s+high\s+demand|temporary\s+errors|rate[-\s]?limit(?:ed)?|too\s+many\s+requests|\b429\b|server\s+overloaded|service\s+unavailable|try\s+again\s+later)/i;
 const CODEX_REMOTE_COMPACTION_RE = /remote\s+compact\s+task/i;
-// Matches the codex usage-limit / credit-exhaustion message and captures the
-// reset time. Tolerant of the CLI's differing phrasings between the "switch to
-// another model now, or try again at <time>" and "…purchase more credits or try
-// again at <time>" variants (and any future wording between the limit notice
-// and the reset clock).
 const CODEX_USAGE_LIMIT_RE =
   /you(?:'|’)ve hit your usage limit\b[\s\S]{0,200}?\btry again at\s+([^.!\n]+)(?:[.!]|\n|$)/i;
 // Bare usage-limit signature, independent of whether a reset time is present or
@@ -20,6 +15,8 @@ const CODEX_USAGE_LIMIT_RE =
 // Jul 6th, 2026 9:47 PM" vs future variants); the wall itself is what matters
 // for classifying the failure as provider exhaustion.
 const CODEX_USAGE_LIMIT_SIGNATURE_RE = /you(?:'|’)ve hit your usage limit/i;
+const CODEX_PROVIDER_QUOTA_RE =
+  /(?:you(?:'|’)ve hit your usage limit|usage limit|model (?:is )?at capacity|at capacity for this model|capacity limit)/i;
 
 export function parseCodexJsonl(stdout: string) {
   let sessionId: string | null = null;
@@ -274,6 +271,7 @@ export function isCodexTransientUpstreamError(input: {
 }): boolean {
   const haystack = buildCodexErrorHaystack(input);
 
+  if (isCodexProviderQuotaError(input)) return false;
   if (extractCodexRetryNotBefore(input) != null) return true;
   // A usage-limit wall is provider exhaustion even when its reset time is
   // missing or unparseable (the CLI's time wording drifts across versions).
@@ -283,4 +281,13 @@ export function isCodexTransientUpstreamError(input: {
   // failure shape, plus explicit usage-limit windows that tell us when retrying
   // becomes safe again.
   return CODEX_REMOTE_COMPACTION_RE.test(haystack) || /high\s+demand|temporary\s+errors/i.test(haystack);
+}
+
+export function isCodexProviderQuotaError(input: {
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): boolean {
+  const haystack = buildCodexErrorHaystack(input);
+  return CODEX_PROVIDER_QUOTA_RE.test(haystack) || extractCodexRetryNotBefore(input) != null;
 }

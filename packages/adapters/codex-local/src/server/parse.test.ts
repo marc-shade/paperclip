@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   extractCodexRetryNotBefore,
+  isCodexProviderQuotaError,
   isCodexTransientUpstreamError,
   isCodexUnknownSessionError,
   parseCodexJsonl,
@@ -103,51 +104,52 @@ describe("isCodexTransientUpstreamError", () => {
     ).toBe(true);
   });
 
-  it("classifies usage-limit windows as transient and extracts the retry time", () => {
+  it("classifies usage-limit windows as provider quota and extracts the retry time", () => {
     const errorMessage = "You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at 11:31 PM.";
     const now = new Date(2026, 3, 22, 22, 29, 2);
 
-    expect(isCodexTransientUpstreamError({ errorMessage })).toBe(true);
+    expect(isCodexProviderQuotaError({ errorMessage })).toBe(true);
+    expect(isCodexTransientUpstreamError({ errorMessage })).toBe(false);
     expect(extractCodexRetryNotBefore({ errorMessage }, now)?.getTime()).toBe(
       new Date(2026, 3, 22, 23, 31, 0, 0).getTime(),
     );
   });
 
-  it("classifies the 'purchase more credits' usage-limit message and extracts the retry time", () => {
-    // The live codex CLI message format (2026-06): no "for <model>" clause and
-    // "purchase more credits or try again at <time>" instead of "switch to
-    // another model now". Must still classify as transient + extract the reset.
-    const errorMessage =
-      "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 10:26 AM.";
-    const now = new Date(2026, 5, 27, 8, 0, 0);
+  it("classifies model-capacity messages as provider quota without reset metadata", () => {
+    const errorMessage = "The requested model is at capacity. Please try again later.";
 
-    expect(isCodexTransientUpstreamError({ errorMessage })).toBe(true);
-    expect(extractCodexRetryNotBefore({ errorMessage }, now)?.getTime()).toBe(
-      new Date(2026, 5, 27, 10, 26, 0, 0).getTime(),
-    );
+    expect(isCodexProviderQuotaError({ errorMessage })).toBe(true);
+    expect(isCodexTransientUpstreamError({ errorMessage })).toBe(false);
+    expect(extractCodexRetryNotBefore({ errorMessage })).toBeNull();
   });
 
-  it("classifies date-bearing usage-limit resets and extracts the retry date", () => {
+  it("classifies date-bearing usage-limit resets as provider quota and extracts the retry date", () => {
     // Live spark-exhaustion message observed 2026-07-04: the reset is a full
-    // date ("Jul 6th, 2026 9:47 PM"), not a bare clock time. Before the
-    // absolute-date fallback this returned null and the run never cascaded.
+    // date ("Jul 6th, 2026 9:47 PM"), not a bare clock time.
     const errorMessage =
       "You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at Jul 6th, 2026 9:47 PM.";
     const now = new Date(2026, 6, 4, 21, 0, 0);
 
-    expect(isCodexTransientUpstreamError({ errorMessage })).toBe(true);
+    expect(isCodexProviderQuotaError({ errorMessage })).toBe(true);
+    expect(isCodexTransientUpstreamError({ errorMessage })).toBe(false);
     expect(extractCodexRetryNotBefore({ errorMessage }, now)?.getTime()).toBe(
       new Date(2026, 6, 6, 21, 47, 0, 0).getTime(),
     );
   });
 
-  it("classifies usage-limit walls with no parseable reset time as transient upstream", () => {
+  it("classifies usage-limit walls with no parseable reset time as provider quota", () => {
+    expect(
+      isCodexProviderQuotaError({
+        errorMessage:
+          "You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now.",
+      }),
+    ).toBe(true);
     expect(
       isCodexTransientUpstreamError({
         errorMessage:
           "You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now.",
       }),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("parses explicit timezone hints on usage-limit retry windows", () => {

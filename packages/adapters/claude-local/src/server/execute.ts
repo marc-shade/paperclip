@@ -49,7 +49,9 @@ import {
   describeClaudeFailure,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
+  isClaudeProviderQuotaError,
   isClaudeMaxTurnsResult,
+  isClaudeProviderQuotaError,
   isClaudeRefusalResult,
   isClaudeTransientUpstreamError,
   isClaudeUnknownSessionError,
@@ -793,6 +795,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       onSpawn,
       onRuntimeProgress: ctx.onRuntimeProgress,
       onLog,
+      runLogTail: paperclipBridge?.runLogTail,
       terminalResultCleanup: {
         graceMs: terminalResultCleanupGraceMs,
         hasTerminalResult: ({ stdout }) => parseClaudeStreamJson(stdout).resultJson !== null,
@@ -839,8 +842,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     if (!parsed) {
       const fallbackErrorMessage = parseFallbackErrorMessage(proc);
+      const providerQuota =
+        !loginMeta.requiresLogin &&
+        (proc.exitCode ?? 0) !== 0 &&
+        isClaudeProviderQuotaError({
+          parsed: null,
+          stdout: proc.stdout,
+          stderr: proc.stderr,
+          errorMessage: fallbackErrorMessage,
+        });
       const transientUpstream =
         !loginMeta.requiresLogin &&
+        !providerQuota &&
         (proc.exitCode ?? 0) !== 0 &&
         isClaudeTransientUpstreamError({
           parsed: null,
@@ -848,7 +861,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stderr: proc.stderr,
           errorMessage: fallbackErrorMessage,
         });
-      const transientRetryNotBefore = transientUpstream
+      const transientRetryNotBefore = providerQuota || transientUpstream
         ? extractClaudeRetryNotBefore({
             parsed: null,
             stdout: proc.stdout,
@@ -858,27 +871,38 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : null;
       const errorCode = loginMeta.requiresLogin
         ? "claude_auth_required"
+        : providerQuota
+        ? "provider_quota"
         : transientUpstream
         ? "claude_transient_upstream"
         : null;
+      const errorFamily =
+        providerQuota
+          ? "provider_quota"
+          : transientUpstream
+          ? "transient_upstream"
+          : null;
       return {
         exitCode: proc.exitCode,
         signal: proc.signal,
         timedOut: false,
         errorMessage: fallbackErrorMessage,
         errorCode,
-        errorFamily: transientUpstream ? "transient_upstream" : null,
+        errorFamily,
         retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
         errorMeta,
         resultJson: {
           stdout: proc.stdout,
           stderr: proc.stderr,
-          ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
+          ...(errorFamily ? { errorFamily } : {}),
           ...(transientRetryNotBefore
             ? { retryNotBefore: transientRetryNotBefore.toISOString() }
             : {}),
           ...(transientRetryNotBefore
             ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() }
+            : {}),
+          ...(providerQuota && transientRetryNotBefore
+            ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() }
             : {}),
         },
         clearSession: Boolean(opts.clearSessionOnMissingSession),
@@ -913,8 +937,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // grading those runs failed re-runs an already-completed tick and pollutes
     // failure metrics (recurring on monitor-arming agent sessions). Trust the
     // result event over the exit code; is_error=true still fails.
-    const completedSuccessfully =
-      asString(parsed.subtype, "") === "success" && !parsedIsError;
+    const completedSuccessfully = asString(parsed.subtype, "").toLowerCase() === "success" && !parsedIsError;
     const failed = !completedSuccessfully && ((proc.exitCode ?? 0) !== 0 || parsedIsError);
     // Validate-before-persist guard: never persist a sessionId whose transcript
     // is known-poisoned. The Claude CLI keeps an on-disk JSONL keyed by the
@@ -943,18 +966,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const errorMessage = failed
       ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
       : null;
+    const providerQuota =
+      failed &&
+      !loginMeta.requiresLogin &&
+      !clearSessionForMaxTurns &&
+      !poisonedPreviousMessageId &&
+      isClaudeProviderQuotaError({
+        parsed,
+        stdout: proc.stdout,
+        stderr: proc.stderr,
+        errorMessage,
+      });
     const transientUpstream =
       failed &&
       !loginMeta.requiresLogin &&
       !clearSessionForMaxTurns &&
       !poisonedPreviousMessageId &&
+      !providerQuota &&
       isClaudeTransientUpstreamError({
         parsed,
         stdout: proc.stdout,
         stderr: proc.stderr,
         errorMessage,
       });
-    const transientRetryNotBefore = transientUpstream
+    const transientRetryNotBefore = providerQuota || transientUpstream
       ? extractClaudeRetryNotBefore({
           parsed,
           stdout: proc.stdout,
@@ -968,6 +1003,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? "max_turns_exhausted"
       : failed && poisonedPreviousMessageId
       ? "claude_poisoned_previous_message_id"
+      : providerQuota
+      ? "provider_quota"
       : transientUpstream
       ? "claude_transient_upstream"
       : claudeRefusal
@@ -977,15 +1014,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // so a trusted subtype=success verdict must also normalize the reported exit
     // code. Preserve the raw process exit code in resultJson for forensics.
     const exitCodeOverridden = completedSuccessfully && (proc.exitCode ?? 0) !== 0;
+    const errorFamily =
+      providerQuota
+        ? "provider_quota"
+        : transientUpstream
+        ? "transient_upstream"
+        : claudeRefusal
+        ? "model_refusal"
+        : null;
     const mergedResultJson: Record<string, unknown> = {
       ...parsed,
       ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
       ...(failed && poisonedPreviousMessageId ? { stopReason: "claude_poisoned_previous_message_id" } : {}),
       ...(claudeRefusal ? { stopReason: "refusal", errorFamily: "model_refusal" } : {}),
-      ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
+      ...(errorFamily ? { errorFamily } : {}),
       ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
+      ...(providerQuota && transientRetryNotBefore
+        ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() }
+        : {}),
       ...(exitCodeOverridden ? { processExitCode: proc.exitCode } : {}),
+      ...(providerQuota && transientRetryNotBefore ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
     };
 
     return {
@@ -994,11 +1043,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timedOut: false,
       errorMessage,
       errorCode: resolvedErrorCode,
-      errorFamily: transientUpstream
-        ? "transient_upstream"
-        : claudeRefusal
-        ? "model_refusal"
-        : null,
+      errorFamily,
       retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
       errorMeta,
       usage,

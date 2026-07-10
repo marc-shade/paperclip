@@ -62,7 +62,7 @@ function RecoveryPreviewDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="max-h-[min(28rem,65vh)] space-y-3 overflow-y-auto pr-1">
+        <div className="max-h-(--sz-calc-36) space-y-3 overflow-y-auto pr-1">
           {preview && preview.items.length === 0 ? (
             <div className="rounded-md border border-border bg-muted/30 px-3 py-4 text-sm text-muted-foreground">
               No recovery tasks would be created right now. Auto-recovery can still run for future liveness incidents in
@@ -232,10 +232,8 @@ export function InstanceExperimentalSettings() {
 
   const enableEnvironments = experimentalQuery.data?.enableEnvironments === true;
   const enableIsolatedWorkspaces = experimentalQuery.data?.enableIsolatedWorkspaces === true;
-  // Default ON: treat anything but an explicit `false` as enabled so
-  // the toggle reflects the streamlined sidebar being the default experience.
-  const enableStreamlinedLeftNavigation =
-    experimentalQuery.data?.enableStreamlinedLeftNavigation !== false;
+  // Streamlined left navigation is now the standard sidebar (PAP-12472); the
+  // experimental opt-out was retired, so it no longer surfaces a toggle here.
   const enableConferenceRoomChat = experimentalQuery.data?.enableConferenceRoomChat === true;
   const enableIssuePlanDecompositions =
     experimentalQuery.data?.enableIssuePlanDecompositions === true;
@@ -244,6 +242,7 @@ export function InstanceExperimentalSettings() {
   const enableTaskWatchdogs = experimentalQuery.data?.enableTaskWatchdogs === true;
   const enableCloudSync = experimentalQuery.data?.enableCloudSync === true;
   const enableExternalObjects = experimentalQuery.data?.enableExternalObjects === true;
+  const enableGoalsSidebarLink = experimentalQuery.data?.enableGoalsSidebarLink === true;
   const enableServerInfoDebugView = experimentalQuery.data?.enableServerInfoDebugView === true;
   const autoRestartDevServerWhenIdle = experimentalQuery.data?.autoRestartDevServerWhenIdle === true;
   const enableIssueGraphLivenessAutoRecovery =
@@ -378,6 +377,23 @@ export function InstanceExperimentalSettings() {
       <section className="rounded-xl border border-border bg-card p-5">
         <div className="flex items-start justify-between gap-4">
           <div className="space-y-1.5">
+            <h2 className="text-sm font-semibold">Goals Sidebar Link</h2>
+            <p className="max-w-2xl text-sm text-muted-foreground">
+              Restore the Goals item in the main sidebar while the goals surface is being evaluated.
+            </p>
+          </div>
+          <ToggleSwitch
+            checked={enableGoalsSidebarLink}
+            onCheckedChange={() => toggleMutation.mutate({ enableGoalsSidebarLink: !enableGoalsSidebarLink })}
+            disabled={toggleMutation.isPending}
+            aria-label="Toggle goals sidebar link experimental setting"
+          />
+        </div>
+      </section>
+
+      <section className="rounded-xl border border-border bg-card p-5">
+        <div className="flex items-start justify-between gap-4">
+          <div className="space-y-1.5">
             <h2 className="text-sm font-semibold">Enable Isolated Workspaces</h2>
             <p className="max-w-2xl text-sm text-muted-foreground">
               Show execution workspace controls in project configuration and allow isolated workspace behavior for new
@@ -389,28 +405,6 @@ export function InstanceExperimentalSettings() {
             onCheckedChange={() => toggleMutation.mutate({ enableIsolatedWorkspaces: !enableIsolatedWorkspaces })}
             disabled={toggleMutation.isPending}
             aria-label="Toggle isolated workspaces experimental setting"
-          />
-        </div>
-      </section>
-
-      <section className="rounded-xl border border-border bg-card p-5">
-        <div className="flex items-start justify-between gap-4">
-          <div className="space-y-1.5">
-            <h2 className="text-sm font-semibold">Streamlined Left Navigation Bar</h2>
-            <p className="max-w-2xl text-sm text-muted-foreground">
-              Reduces the maximum number of items in the left navigation bar — nests Projects under Work with a
-              dedicated Projects page, and shows only active agents (max 5 recently-active) in the sidebar.
-            </p>
-          </div>
-          <ToggleSwitch
-            checked={enableStreamlinedLeftNavigation}
-            onCheckedChange={() =>
-              toggleMutation.mutate({
-                enableStreamlinedLeftNavigation: !enableStreamlinedLeftNavigation,
-              })
-            }
-            disabled={toggleMutation.isPending}
-            aria-label="Toggle streamlined left navigation experimental setting"
           />
         </div>
       </section>
@@ -565,7 +559,7 @@ export function InstanceExperimentalSettings() {
             />
           </div>
 
-          <div className="grid gap-3 sm:grid-cols-[minmax(10rem,14rem)_1fr] sm:items-end">
+          <div className="grid gap-3 sm:grid-cols-(--gtc-35) sm:items-end">
             <label className="space-y-1.5">
               <span className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
                 <Clock className="h-3.5 w-3.5" />
