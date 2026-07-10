@@ -496,9 +496,9 @@ function readProviderExhaustedFlag(
 // Persisting the marker at finalize means the cascade decision can detect the
 // exhaustion from data that lives ON the run's resultJson — it does not depend on
 // the in-memory `.error` field, which is not reliably populated when the failover
-// decision runs inline at run-finalize. Scoped to the transient_upstream family so
-// ordinary failures (and brief 429 blips carrying no exhaustion message) are left
-// untouched.
+  // decision runs inline at run-finalize. Scoped to provider-quota aware transient
+  // families so ordinary failures (and brief 429 blips carrying no exhaustion
+  // message) are left untouched.
 export function providerExhaustionResultJsonPatch(input: {
   errorCode: string | null | undefined;
   errorMessage: string | null | undefined;

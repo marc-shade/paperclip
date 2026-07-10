@@ -49,6 +49,7 @@ import {
   describeClaudeFailure,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
+  isClaudeProviderQuotaError,
   isClaudeMaxTurnsResult,
   isClaudeProviderQuotaError,
   isClaudeRefusalResult,
@@ -875,7 +876,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : transientUpstream
         ? "claude_transient_upstream"
         : null;
-      const errorFamily = providerQuota ? "provider_quota" : transientUpstream ? "transient_upstream" : null;
+      const errorFamily =
+        providerQuota
+          ? "provider_quota"
+          : transientUpstream
+          ? "transient_upstream"
+          : null;
       return {
         exitCode: proc.exitCode,
         signal: proc.signal,
@@ -1008,13 +1014,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // so a trusted subtype=success verdict must also normalize the reported exit
     // code. Preserve the raw process exit code in resultJson for forensics.
     const exitCodeOverridden = completedSuccessfully && (proc.exitCode ?? 0) !== 0;
-    const errorFamily = providerQuota
-      ? "provider_quota"
-      : transientUpstream
-      ? "transient_upstream"
-      : claudeRefusal
-      ? "model_refusal"
-      : null;
+    const errorFamily =
+      providerQuota
+        ? "provider_quota"
+        : transientUpstream
+        ? "transient_upstream"
+        : claudeRefusal
+        ? "model_refusal"
+        : null;
     const mergedResultJson: Record<string, unknown> = {
       ...parsed,
       ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
@@ -1023,6 +1030,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(errorFamily ? { errorFamily } : {}),
       ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
+      ...(providerQuota && transientRetryNotBefore
+        ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() }
+        : {}),
       ...(exitCodeOverridden ? { processExitCode: proc.exitCode } : {}),
       ...(providerQuota && transientRetryNotBefore ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
     };
