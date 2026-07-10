@@ -53,6 +53,7 @@ import {
   reconcileAdapterAvailability,
 } from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
+import { inspectDatabaseBackupHealth } from "./services/database-backup-health.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
@@ -1052,6 +1053,39 @@ export async function startServer(): Promise<StartedServer> {
         // runServerDatabaseBackup already logs the failure with context.
       });
     }, backupIntervalMs);
+
+    // The interval alone never fires on a process that restarts more often
+    // than the backup cadence (deploys, crashes), which silently starves
+    // backups. If the newest on-disk backup is already older than the
+    // cadence, take a catch-up backup shortly after boot; the small delay
+    // keeps pg_dump load out of the startup path and off crash-loops.
+    const backupHealthAtBoot = inspectDatabaseBackupHealth({
+      enabled: config.databaseBackupEnabled,
+      backupDir: config.databaseBackupDir,
+      maxAgeHours: databaseBackupMaxAgeHours,
+      alertFile: databaseBackupAlertFile,
+      alertFiles: databaseBackupAlertFiles,
+    });
+    const latestBackupAgeMs = backupHealthAtBoot.latestBackup
+      ? backupHealthAtBoot.latestBackup.ageHours * 3_600_000
+      : Number.POSITIVE_INFINITY;
+    if (latestBackupAgeMs > backupIntervalMs) {
+      const catchupDelayMs = 5 * 60 * 1000;
+      logger.info(
+        {
+          latestBackup: backupHealthAtBoot.latestBackup?.name ?? null,
+          latestBackupAgeHours: backupHealthAtBoot.latestBackup?.ageHours ?? null,
+          catchupDelayMs,
+        },
+        "Latest database backup is older than the backup interval; scheduling catch-up backup",
+      );
+      const catchupTimer = setTimeout(() => {
+        void runServerDatabaseBackup("scheduled").catch(() => {
+          // runServerDatabaseBackup already logs the failure with context.
+        });
+      }, catchupDelayMs);
+      catchupTimer.unref?.();
+    }
   }
   
   // Wait for external adapters to finish loading before accepting requests.
