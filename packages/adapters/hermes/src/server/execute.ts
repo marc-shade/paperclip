@@ -70,8 +70,35 @@ function cfgStringArray(v: unknown): string[] | undefined {
     : undefined;
 }
 
+/**
+ * CLI binaries owned by other Paperclip local adapters. Paperclip preserves
+ * adapter_config keys when an agent's adapter type is switched, so a generic
+ * `command` override like "claude" can survive a claude_local → hermes_local
+ * switch. Spawning that binary with hermes args fails every run
+ * (`error: unknown option '-q'` — KIN-752), so such leftovers are ignored in
+ * favor of the hermes CLI. `hermesCommand` is adapter-specific and always
+ * honored.
+ */
+const OTHER_ADAPTER_CLIS = new Set([
+  "claude",
+  "codex",
+  "gemini",
+  "cursor",
+  "cursor-agent",
+  "grok",
+  "opencode",
+  "pi",
+  "acpx",
+]);
+
 export function resolveHermesCommand(config: Record<string, unknown>): string {
-  return cfgString(config.hermesCommand) || cfgString(config.command) || HERMES_CLI;
+  const adapterSpecific = cfgString(config.hermesCommand);
+  if (adapterSpecific) return adapterSpecific;
+  const generic = cfgString(config.command);
+  if (generic && !OTHER_ADAPTER_CLIS.has(path.basename(generic).toLowerCase())) {
+    return generic;
+  }
+  return HERMES_CLI;
 }
 
 // ---------------------------------------------------------------------------
@@ -258,7 +285,45 @@ function cleanResponse(raw: string): string {
 // Output parsing
 // ---------------------------------------------------------------------------
 
-function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
+/**
+ * Strip Python "unraisable exception" blocks that the interpreter prints to
+ * stderr during shutdown (e.g. parked MCP reconnect coroutines being GC'd
+ * after the event loop closed):
+ *
+ *   Exception ignored in: <coroutine object MCPServerTask.run at 0x...>
+ *   Traceback (most recent call last):
+ *     File ".../mcp_tool.py", line 2590, in run
+ *       ...
+ *   RuntimeError: Event loop is closed
+ *
+ * Python has already ignored these by definition; the process still exits 0
+ * and the run result is unaffected. Without this, the error-pattern scan
+ * below flags successful runs as adapter failures.
+ */
+export function stripUnraisableShutdownBlocks(stderr: string): string {
+  const kept: string[] = [];
+  let inBlock = false;
+  for (const line of stderr.split("\n")) {
+    if (line.startsWith("Exception ignored in:")) {
+      inBlock = true;
+      continue;
+    }
+    if (inBlock) {
+      if (line.startsWith("Traceback (most recent call last):") || /^\s/.test(line)) {
+        continue; // traceback header or indented frame line
+      }
+      if (/^[\w.]+(Error|Exception|Warning)\b/.test(line)) {
+        inBlock = false; // final "SomeError: message" line ends the block
+        continue;
+      }
+      inBlock = false; // unrelated line — block ended, keep it
+    }
+    kept.push(line);
+  }
+  return kept.join("\n");
+}
+
+export function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   const combined = stdout + "\n" + stderr;
   const result: ParsedOutput = {};
 
@@ -303,9 +368,10 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
     result.costUsd = parseFloat(costMatch[1]);
   }
 
-  // Check for error patterns in stderr
-  if (stderr.trim()) {
-    const errorLines = stderr
+  // Check for error patterns in stderr (ignoring interpreter-shutdown noise)
+  const scannableStderr = stripUnraisableShutdownBlocks(stderr);
+  if (scannableStderr.trim()) {
+    const errorLines = scannableStderr
       .split("\n")
       .filter((line) => /error|exception|traceback|failed/i.test(line))
       .filter((line) => !/INFO|DEBUG|warn/i.test(line)); // skip log-level noise
