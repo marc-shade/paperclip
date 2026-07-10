@@ -380,6 +380,44 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       .then((rows) => rows[0]?.count ?? 0);
   }
 
+  async function hasOpenChildIssues(companyId: string, issueId: string) {
+    return db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.parentId, issueId),
+          isNull(issues.hiddenAt),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows.length > 0);
+  }
+
+  // KIN-602: a coordination watch — an issue with open children whose recent
+  // terminal runs all succeeded while re-stating one deterministic next action
+  // — wakes often by design (children-completed waits, continuity comments).
+  // That cadence is not productivity churn; the children carry the real work,
+  // and reviewing the watch loop spams managers (the KIN-600 pattern).
+  async function isDeterministicCoordinationWatchCadence(
+    sourceIssue: IssueRow,
+    terminalRuns: HeartbeatRunRow[],
+    since: Date,
+  ) {
+    const windowRuns = terminalRuns.filter(
+      (run) => (run.startedAt ?? run.createdAt).getTime() >= since.getTime(),
+    );
+    if (windowRuns.length === 0) return false;
+    if (!windowRuns.every((run) => run.status === "succeeded")) return false;
+    const nextActions = new Set(
+      windowRuns.map((run) => run.nextAction?.replace(/\s+/g, " ").trim().toLowerCase() || null),
+    );
+    if (nextActions.size !== 1 || nextActions.has(null)) return false;
+    return hasOpenChildIssues(sourceIssue.companyId, sourceIssue.id);
+  }
+
   async function collectEvidence(
     sourceIssue: IssueRow,
     sourceAgent: AgentRow,
@@ -477,11 +515,13 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
     const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
-    const highChurn =
+    const highChurnSignal =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
       runCountLastSixHours >= thresholds.highChurnSixHours ||
       assigneeRunCommentCountLastSixHours >= thresholds.highChurnSixHours;
+    const highChurn = highChurnSignal &&
+      !(await isDeterministicCoordinationWatchCadence(sourceIssue, terminalRuns, sixHoursAgo));
     const trigger = choosePrimaryTrigger({ noComment, longActive, highChurn });
     if (!trigger) return null;
 

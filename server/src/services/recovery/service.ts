@@ -102,6 +102,18 @@ export const STRANDED_RECENT_PROGRESS_EXEMPTION_MS = Math.max(
   Number(process.env.STRANDED_RECENT_PROGRESS_EXEMPTION_MS) || 30 * 60 * 1000,
 );
 
+// KIN-602: an `in_progress` issue with open children is a coordination watch —
+// each successful continuation wake typically just re-posts a deterministic
+// continuity comment while the real signal is the children-completed wake.
+// Requeueing that watch every scheduler tick produced comment/run churn
+// (KIN-600), so hold successful-continuation requeues until this minimum quiet
+// period has elapsed since the last run finished. Floor the override at 60s so
+// misconfiguration cannot disable the backoff entirely.
+export const COORDINATION_WATCH_CONTINUATION_MIN_BACKOFF_MS = Math.max(
+  60_000,
+  Number(process.env.COORDINATION_WATCH_CONTINUATION_MIN_BACKOFF_MS) || 15 * 60 * 1000,
+);
+
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";
@@ -123,6 +135,8 @@ type LatestIssueRun = Pick<
   "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState"
 > & {
   resultJson?: unknown;
+  finishedAt?: Date | null;
+  createdAt?: Date | null;
 } | null;
 type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeeded" };
 
@@ -548,6 +562,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         contextSnapshot: heartbeatRuns.contextSnapshot,
         livenessState: heartbeatRuns.livenessState,
         resultJson: heartbeatRuns.resultJson,
+        finishedAt: heartbeatRuns.finishedAt,
+        createdAt: heartbeatRuns.createdAt,
       })
       .from(heartbeatRuns)
       .where(
@@ -742,6 +758,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .then((rows) => rows[0] ?? null),
     ]);
     return Boolean(comment || attachment);
+  }
+
+  // KIN-602: open (non-terminal, visible) children mark the parent as a
+  // coordination watch for the continuation backoff above.
+  async function hasOpenChildIssues(companyId: string, issueId: string) {
+    return db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.parentId, issueId),
+          isNull(issues.hiddenAt),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows.length > 0);
   }
 
   async function enqueueStrandedIssueRecovery(input: {
@@ -2872,6 +2906,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       escalated: 0,
       waitingOnReviewResolved: 0,
       recentProgressExempted: 0,
+      coordinationWatchBackoffHeld: 0,
       skipped: 0,
       issueIds: [] as string[],
     };
@@ -3139,6 +3174,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
         if (!isProductiveContinuationRun(successfulRun)) {
           result.successfulContinuationObserved += 1;
+          result.skipped += 1;
+          continue;
+        }
+
+        // KIN-602: coordination watches (open children) don't need a
+        // continuation wake every scheduler tick — the children-completed wake
+        // is the real signal. Hold the requeue (and the repeated-productive
+        // escalation below, which would be a false positive for a healthy
+        // watch) until the minimum quiet period has passed.
+        const settledAt = successfulRun.finishedAt ?? successfulRun.createdAt ?? null;
+        if (
+          settledAt &&
+          Date.now() - settledAt.getTime() < COORDINATION_WATCH_CONTINUATION_MIN_BACKOFF_MS &&
+          await hasOpenChildIssues(issue.companyId, issue.id)
+        ) {
+          result.coordinationWatchBackoffHeld += 1;
           result.skipped += 1;
           continue;
         }

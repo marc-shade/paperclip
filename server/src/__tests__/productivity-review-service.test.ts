@@ -120,6 +120,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     count: number;
     now: Date;
     withRunComments?: boolean;
+    runOverrides?: (index: number) => Partial<typeof heartbeatRuns.$inferInsert>;
   }) {
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
     for (let index = 0; index < input.count; index += 1) {
@@ -139,6 +140,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         nextAction: "Continue processing the next batch.",
         createdAt,
         updatedAt: createdAt,
+        ...(input.runOverrides?.(index) ?? {}),
       });
     }
     await db.insert(heartbeatRuns).values(runs);
@@ -419,6 +421,89 @@ describeEmbeddedPostgres("productivity review service", () => {
 
     expect(result.created).toBe(0);
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  async function insertOpenChildIssue(seeded: { companyId: string; issueId: string; issuePrefix: string }) {
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      parentId: seeded.issueId,
+      title: "Delegated child work",
+      status: "in_progress",
+      priority: "medium",
+      issueNumber: 99,
+      identifier: `${seeded.issuePrefix}-99`,
+    });
+  }
+
+  it("suppresses the high-churn trigger for deterministic coordination watches with open children (KIN-602)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertOpenChildIssue(seeded);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 12,
+      now,
+      withRunComments: true,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("still creates a high-churn review for a coordination watch when a windowed run failed (KIN-602)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertOpenChildIssue(seeded);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 12,
+      now,
+      withRunComments: true,
+      runOverrides: (index) => (index === 0 ? { status: "failed", livenessState: "failed" } : {}),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
+  });
+
+  it("still creates a high-churn review for a coordination watch when next actions vary (KIN-602)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertOpenChildIssue(seeded);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 12,
+      now,
+      withRunComments: true,
+      runOverrides: (index) => ({ nextAction: `Investigate flaky module ${index}.` }),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
   });
 
   it("skips productivity-review descendants so reviews cannot recursively spawn reviews", async () => {

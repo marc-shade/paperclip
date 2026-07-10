@@ -653,6 +653,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     livenessState?: "completed" | "advanced" | "plan_only" | "empty_response" | "blocked" | "failed" | "needs_followup" | null;
     runErrorCode?: string | null;
     runError?: string | null;
+    runFinishedAt?: Date;
+    openChildIssue?: boolean;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -660,6 +662,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const wakeupRequestId = randomUUID();
     const rootIssueId = randomUUID();
     const issueId = randomUUID();
+    const childIssueId = randomUUID();
     const now = new Date("2026-03-19T00:00:00.000Z");
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
@@ -718,8 +721,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         ...(input.runSource ? { source: input.runSource } : {}),
       },
       startedAt: now,
-      finishedAt: new Date("2026-03-19T00:05:00.000Z"),
-      updatedAt: new Date("2026-03-19T00:05:00.000Z"),
+      finishedAt: input.runFinishedAt ?? new Date("2026-03-19T00:05:00.000Z"),
+      updatedAt: input.runFinishedAt ?? new Date("2026-03-19T00:05:00.000Z"),
       errorCode: input.runStatus === "succeeded"
         ? null
         : ("runErrorCode" in input ? input.runErrorCode : "process_lost"),
@@ -758,6 +761,19 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         identifier: `${issuePrefix}-${input.activePauseHold ? 2 : 1}`,
         startedAt: input.status === "in_progress" ? now : null,
       },
+      ...(input.openChildIssue
+        ? [{
+          id: childIssueId,
+          companyId,
+          parentId: issueId,
+          title: "Delegated child work",
+          status: "todo",
+          priority: "medium",
+          responsibleUserId: "responsible-user",
+          issueNumber: input.activePauseHold ? 3 : 2,
+          identifier: `${issuePrefix}-${input.activePauseHold ? 3 : 2}`,
+        }]
+        : []),
     ]);
 
     if (input.activePauseHold) {
@@ -4253,6 +4269,78 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       retryReason: "issue_continuation_needed",
       source: "issue.productive_terminal_continuation_recovery",
     });
+    if (retryRun) {
+      await waitForRunToSettle(heartbeat, retryRun.id);
+    }
+  });
+
+  it("holds successful coordination-watch continuations inside the minimum backoff window (KIN-602)", async () => {
+    const { agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+      runFinishedAt: new Date(Date.now() - 60_000),
+      openChildIssue: true,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.coordinationWatchBackoffHeld).toBe(1);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+  });
+
+  it("requeues coordination-watch continuations after the minimum backoff window elapses (KIN-602)", async () => {
+    const { agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+      runFinishedAt: new Date(Date.now() - 16 * 60_000),
+      openChildIssue: true,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.coordinationWatchBackoffHeld).toBe(0);
+    expect(result.continuationRequeued).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    const retryRun = runs.find((row) => row.id !== runId);
+    expect(retryRun?.contextSnapshot as Record<string, unknown> | undefined).toMatchObject({
+      issueId,
+      retryReason: "issue_continuation_needed",
+      source: "issue.productive_terminal_continuation_recovery",
+    });
+    if (retryRun) {
+      await waitForRunToSettle(heartbeat, retryRun.id);
+    }
+  });
+
+  it("does not hold successful continuations for issues without open children (KIN-602)", async () => {
+    const { agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+      runFinishedAt: new Date(Date.now() - 60_000),
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.coordinationWatchBackoffHeld).toBe(0);
+    expect(result.continuationRequeued).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    const retryRun = runs.find((row) => row.id !== runId);
     if (retryRun) {
       await waitForRunToSettle(heartbeat, retryRun.id);
     }
