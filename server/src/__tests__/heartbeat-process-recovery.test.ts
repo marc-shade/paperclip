@@ -1096,12 +1096,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows.map((row) => row.blockerIssueId));
   }
 
-  async function seedQueuedIssueRunFixture() {
+  async function seedQueuedIssueRunFixture(options?: { openChildIssue?: boolean }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runId = randomUUID();
     const wakeupRequestId = randomUUID();
     const issueId = randomUUID();
+    const childIssueId = randomUUID();
     const now = new Date("2026-03-19T00:00:00.000Z");
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
@@ -1161,22 +1162,37 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       createdAt: now,
     });
 
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      title: "Retry transient Codex failure without blocking",
-      status: "in_progress",
-      priority: "medium",
-      assigneeAgentId: agentId,
-      checkoutRunId: runId,
-      executionRunId: runId,
-      responsibleUserId: "responsible-user",
-      issueNumber: 1,
-      identifier: `${issuePrefix}-1`,
-      startedAt: now,
-    });
+    await db.insert(issues).values([
+      {
+        id: issueId,
+        companyId,
+        title: "Retry transient Codex failure without blocking",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        checkoutRunId: runId,
+        executionRunId: runId,
+        responsibleUserId: "responsible-user",
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+        startedAt: now,
+      },
+      ...(options?.openChildIssue
+        ? [{
+          id: childIssueId,
+          companyId,
+          parentId: issueId,
+          title: "Delegated child work",
+          status: "in_progress" as const,
+          priority: "medium",
+          responsibleUserId: "responsible-user",
+          issueNumber: 2,
+          identifier: `${issuePrefix}-2`,
+        }]
+        : []),
+    ]);
 
-    return { companyId, agentId, runId, wakeupRequestId, issueId };
+    return { companyId, agentId, runId, wakeupRequestId, issueId, childIssueId };
   }
 
   it("keeps a local run active when the recorded pid is still alive", async () => {
@@ -2123,6 +2139,51 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(activityLog)
       .where(eq(activityLog.entityId, issueId));
     expect(activity.some((event) => event.action === "issue.successful_run_handoff_required")).toBe(true);
+  });
+
+  it("does not queue an immediate finish-handoff for a coordination watch with an open child (KIN-815)", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture({ openChildIssue: true });
+    mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        createdByRunId: ctx.runId,
+        body: "Coordinated the delegated child work this cycle; nothing else to do until it finishes.",
+      });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Coordinated the delegated child work this cycle.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+    await waitForHeartbeatIdle(db, 5_000);
+
+    // The immediate handoff path must NOT fire — the open child is the live
+    // continuation. reconcileStrandedAssignedIssues owns the backed-off requeue.
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups.filter((wakeup) => wakeup.reason === "finish_successful_run_handoff")).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.filter((comment) => comment.body === SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY)).toHaveLength(0);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+
+    const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(activity.some((event) => event.action === "issue.successful_run_handoff_required")).toBe(false);
   });
 
   it("requeues a missing-disposition handoff when the previous corrective wake was cancelled", async () => {

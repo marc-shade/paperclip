@@ -51,6 +51,7 @@ function decide(overrides: Partial<Parameters<typeof decideSuccessfulRunHandoff>
     hasPendingInteractionOrApproval: false,
     hasExplicitBlockerPath: false,
     hasOpenRecoveryIssue: false,
+    hasOpenChildCoordinationWatch: false,
     hasPauseHold: false,
     hasActiveRoutineContinuation: false,
     budgetBlocked: false,
@@ -151,6 +152,23 @@ describe("successful run handoff decision", () => {
     })).toEqual({
       kind: "skip",
       reason: "active routine continuation owns the next action",
+    });
+  });
+
+  it("does not queue an immediate handoff when the issue is a coordination watch with open children (KIN-815)", () => {
+    expect(decide({ hasOpenChildCoordinationWatch: true })).toEqual({
+      kind: "skip",
+      reason: "open-child coordination watch is a valid live continuation",
+    });
+    // The suppression holds regardless of whether the run itself looked productive —
+    // the open child is the live continuation, so no immediate recovery wake fires.
+    expect(decide({
+      hasOpenChildCoordinationWatch: true,
+      livenessState: null,
+      detectedProgressSummary: "Run produced concrete action evidence: 1 issue comment(s)",
+    })).toEqual({
+      kind: "skip",
+      reason: "open-child coordination watch is a valid live continuation",
     });
   });
 

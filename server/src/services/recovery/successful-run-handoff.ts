@@ -349,6 +349,7 @@ export function decideSuccessfulRunHandoff(input: {
   hasPendingInteractionOrApproval: boolean;
   hasExplicitBlockerPath: boolean;
   hasOpenRecoveryIssue: boolean;
+  hasOpenChildCoordinationWatch: boolean;
   hasPauseHold: boolean;
   hasActiveRoutineContinuation: boolean;
   budgetBlocked: boolean;
@@ -379,6 +380,16 @@ export function decideSuccessfulRunHandoff(input: {
   }
   if (input.hasActiveRoutineContinuation) {
     return { kind: "skip", reason: "active routine continuation owns the next action" };
+  }
+  // KIN-815: an `in_progress` issue with open children is a coordination watch,
+  // not a missing disposition. Firing an immediate corrective handoff wake here
+  // bypasses the coordination-watch minimum-backoff that
+  // reconcileStrandedAssignedIssues applies (KIN-602), producing the
+  // recover/block churn instead of a stable continuation cadence. The open-child
+  // watch is itself a valid live continuation disposition, so skip the immediate
+  // wake and let the periodic reconciler drive the backed-off continuation.
+  if (input.hasOpenChildCoordinationWatch) {
+    return { kind: "skip", reason: "open-child coordination watch is a valid live continuation" };
   }
   if (!isProductiveSuccessfulRun(input)) {
     return { kind: "skip", reason: "successful run did not produce handoff-relevant progress" };
