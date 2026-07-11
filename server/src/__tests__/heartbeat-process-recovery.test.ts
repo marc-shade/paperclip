@@ -2141,7 +2141,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(activity.some((event) => event.action === "issue.successful_run_handoff_required")).toBe(true);
   });
 
-  it("does not queue an immediate finish-handoff for a coordination watch with an open child (KIN-815)", async () => {
+  it("backs off both immediate and periodic coordination-watch wakes, then continues after 15 minutes (KIN-815)", async () => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture({ openChildIssue: true });
     mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
       await db.insert(issueComments).values({
@@ -2161,11 +2161,39 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         model: "test-model",
       };
     });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db
+        .update(issues)
+        .set({ status: "done", completedAt: new Date() })
+        .where(eq(issues.id, issueId));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Closed the coordination watch after the quiet-period continuation.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
     const heartbeat = heartbeatService(db);
 
     await heartbeat.resumeQueuedRuns();
     await waitForRunToSettle(heartbeat, runId, 5_000);
-    await waitForHeartbeatIdle(db, 5_000);
+    await waitForValue(
+      () => db
+        .select({ status: agents.status })
+        .from(agents)
+        .where(eq(agents.id, agentId))
+        .then((rows) => rows[0]?.status === "idle" ? rows[0] : null),
+      5_000,
+    );
+
+    const successfulRun = await heartbeat.getRun(runId);
+    expect(successfulRun).toMatchObject({
+      status: "succeeded",
+      livenessState: "advanced",
+    });
 
     // The immediate handoff path must NOT fire — the open child is the live
     // continuation. reconcileStrandedAssignedIssues owns the backed-off requeue.
@@ -2174,6 +2202,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId));
     expect(wakeups.filter((wakeup) => wakeup.reason === "finish_successful_run_handoff")).toHaveLength(0);
+
+    const held = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(held.coordinationWatchBackoffHeld).toBe(1);
+    expect(held.continuationRequeued).toBe(0);
+    expect(held.escalated).toBe(0);
+    expect(held.issueIds).toEqual([]);
+
+    const wakeupsInsideBackoff = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeupsInsideBackoff.filter((wakeup) =>
+      wakeup.reason === "finish_successful_run_handoff" || wakeup.reason === "issue_continuation_needed"
+    )).toHaveLength(0);
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments.filter((comment) => comment.body === SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY)).toHaveLength(0);
@@ -2184,7 +2226,50 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
     expect(activity.some((event) => event.action === "issue.successful_run_handoff_required")).toBe(false);
-  });
+
+    await db
+      .update(heartbeatRuns)
+      .set({
+        finishedAt: new Date(Date.now() - 16 * 60_000),
+        updatedAt: new Date(Date.now() - 16 * 60_000),
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const continued = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(continued.coordinationWatchBackoffHeld).toBe(0);
+    expect(continued.continuationRequeued).toBe(1);
+    expect(continued.escalated).toBe(0);
+    expect(continued.issueIds).toEqual([issueId]);
+
+    const wakeupsAfterBackoff = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeupsAfterBackoff.filter((wakeup) => wakeup.reason === "finish_successful_run_handoff")).toHaveLength(0);
+    expect(wakeupsAfterBackoff.filter((wakeup) => wakeup.reason === "issue_continuation_needed")).toHaveLength(1);
+
+    const continuationRun = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.agentId, agentId),
+        eq(heartbeatRuns.id, wakeupsAfterBackoff.find((wakeup) =>
+          wakeup.reason === "issue_continuation_needed"
+        )?.runId ?? ""),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (continuationRun) {
+      await waitForRunToSettle(heartbeat, continuationRun.id, 5_000);
+      await waitForValue(
+        () => db
+          .select({ status: agents.status })
+          .from(agents)
+          .where(eq(agents.id, agentId))
+          .then((rows) => rows[0]?.status === "idle" ? rows[0] : null),
+        5_000,
+      );
+    }
+  }, 20_000);
 
   it("requeues a missing-disposition handoff when the previous corrective wake was cancelled", async () => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
