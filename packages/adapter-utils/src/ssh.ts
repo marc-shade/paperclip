@@ -1198,7 +1198,11 @@ export async function runSshCommand(
       "-p",
       String(config.port),
       `${config.username}@${config.host}`,
-      `sh -c ${shellQuote(remoteScript)}`,
+      // ssh already passes its remote-command argument to the remote login
+      // shell with `-c`. Wrapping the complete script in another quoted
+      // `sh -c` corrupts nested shell-quoted paths when OpenSSH assembles the
+      // remote command (for example during workspace lease setup).
+      remoteScript,
     );
 
     return options.stdin != null
@@ -1253,7 +1257,7 @@ export async function buildSshSpawnTarget(input: {
     "-p",
     String(input.spec.port),
     `${input.spec.username}@${input.spec.host}`,
-    `sh -c ${shellQuote(remoteScript)}`,
+    remoteScript,
   );
 
   return {
