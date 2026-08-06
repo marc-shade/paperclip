@@ -47,6 +47,7 @@ import { resolveRouteOnboardingOptions } from "../lib/onboarding-route";
 import { AsciiArtAnimation } from "./AsciiArtAnimation";
 import { FrontDoor } from "./FrontDoor";
 import { AgentCapsule } from "./AgentCapsule";
+import { Badge } from "@/components/ui/badge";
 import {
   Building2,
   Bot,
@@ -113,9 +114,6 @@ export function OnboardingWizard() {
   const location = useLocation();
   const { companyPrefix } = useParams<{ companyPrefix?: string }>();
 
-  // Sync disabled adapter types from server so the adapter grid filters them out.
-  const disabledTypes = useDisabledAdaptersSync();
-
   // Support opening the wizard from a route (e.g. /onboarding or an existing
   // company's "add agent" entry point) in addition to the dialog context.
   const routeOnboardingOptions =
@@ -131,6 +129,11 @@ export function OnboardingWizard() {
   const effectiveOnboardingOptions = onboardingOpen
     ? onboardingOptions
     : routeOnboardingOptions ?? {};
+
+  // Sync disabled adapter types only when the wizard is visible. The wizard is
+  // mounted globally, including on /auth, where protected adapter routes are
+  // expected to reject signed-out browsers.
+  const disabledTypes = useDisabledAdaptersSync({ enabled: effectiveOnboardingOpen });
 
   const initialStep = effectiveOnboardingOptions.initialStep ?? 0;
   const existingCompanyId = effectiveOnboardingOptions.companyId;
@@ -1265,9 +1268,9 @@ export function OnboardingWizard() {
                           }}
                         >
                           {opt.recommended && (
-                            <span className="absolute -top-1.5 right-1.5 bg-green-500 text-white text-(length:--text-nano) font-semibold px-1.5 py-0.5 rounded-full leading-none">
+                            <Badge variant="ghost" className="absolute -top-1.5 right-1.5 bg-green-500 text-white text-(length:--text-nano) font-semibold px-1.5 leading-none">
                               Recommended
-                            </span>
+                            </Badge>
                           )}
                           <opt.icon className="h-4 w-4" />
                           <span className="font-medium">{opt.label}</span>

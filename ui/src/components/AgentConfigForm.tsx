@@ -5,6 +5,7 @@ import type {
   AdapterEnvironmentTestResult,
   CompanySecret,
   EnvBinding,
+  EnvSecretRefBinding,
   Environment,
 } from "@paperclipai/shared";
 import { AGENT_DEFAULT_MAX_CONCURRENT_RUNS, supportedEnvironmentDriversForAdapter } from "@paperclipai/shared";
@@ -51,13 +52,14 @@ import {
   EnvironmentVariablesEditor,
   type EnvironmentVariablesEditorHandle,
 } from "./environment-variables-editor";
+import { AgentSecretAccessEditor } from "./AgentSecretAccessEditor";
+import { AGENT_ACCESS_CONFIG_PATH_PREFIX } from "../lib/secret-delivery";
 import { shouldShowLegacyWorkingDirectoryField } from "../lib/legacy-agent-config";
 import { listAdapterOptions, listVisibleAdapterTypes } from "../adapters/metadata";
 import { getAdapterDisplay, getAdapterLabel } from "../adapters/adapter-display-registry";
 import { useDisabledAdaptersSync } from "../adapters/use-disabled-adapters";
-import { buildAgentUpdatePatch, type AgentConfigOverlay } from "../lib/agent-config-patch";
+import { buildAgentUpdatePatch, omitUndefinedEntries, type AgentConfigOverlay } from "../lib/agent-config-patch";
 import { useAdapterCapabilities } from "../adapters/use-adapter-capabilities";
-import { filterAcpxModelsByAgent } from "../lib/acpx-model-filter";
 import { resolveForcedKubernetesEnvironment } from "../lib/forced-kubernetes-environment";
 
 /* ---- Create mode values ---- */
@@ -66,6 +68,7 @@ import { resolveForcedKubernetesEnvironment } from "../lib/forced-kubernetes-env
 // so existing imports from this file keep working.
 export type { CreateConfigValues } from "@paperclipai/adapter-utils";
 import type { CreateConfigValues } from "@paperclipai/adapter-utils";
+import { Badge } from "@/components/ui/badge";
 
 /* ---- Props ---- */
 
@@ -116,7 +119,7 @@ const emptyOverlay: AgentConfigOverlay = {
 const EMPTY_ENV: Record<string, EnvBinding> = {};
 
 export function supportsAdapterModelRefresh(adapterType: string): boolean {
-  return adapterType === "claude_local" || adapterType === "codex_local" || adapterType === "acpx_local";
+  return adapterType === "claude_local" || adapterType === "codex_local";
 }
 
 function isOverlayDirty(o: AgentConfigOverlay): boolean {
@@ -194,7 +197,6 @@ function clampInteger(value: number, min: number, max: number) {
 function clampDelayMsFromSeconds(value: number) {
   return clampInteger(value, 0, MAX_TURN_CONTINUATION_MAX_DELAY_SEC) * 1000;
 }
-
 
 /* ---- Form ---- */
 
@@ -324,6 +326,29 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   function flushEnvironmentDraft() {
     return environmentVariablesEditorRef.current?.flushPendingDraft() ?? null;
   }
+
+  /**
+   * Replace the agent's API-access grants (top-level `access.<ALIAS>` keys) with
+   * the complete set emitted by the Secret access editor. Added/changed aliases
+   * are marked into the overlay; aliases dropped from the set are marked
+   * `undefined` so `buildAgentUpdatePatch` strips them.
+   */
+  const applyAccessGrants = useCallback((next: Record<string, EnvSecretRefBinding>) => {
+    if (isCreate) return;
+    setOverlay((prev) => {
+      const effective = { ...(props.agent.adapterConfig ?? {}), ...prev.adapterConfig } as Record<string, unknown>;
+      const nextAdapterConfig: Record<string, unknown> = { ...prev.adapterConfig };
+      for (const [alias, binding] of Object.entries(next)) {
+        nextAdapterConfig[`${AGENT_ACCESS_CONFIG_PATH_PREFIX}${alias}`] = binding;
+      }
+      for (const key of Object.keys(effective)) {
+        if (!key.startsWith(AGENT_ACCESS_CONFIG_PATH_PREFIX)) continue;
+        const alias = key.slice(AGENT_ACCESS_CONFIG_PATH_PREFIX.length);
+        if (!(alias in next)) nextAdapterConfig[key] = undefined;
+      }
+      return { ...prev, adapterConfig: nextAdapterConfig };
+    });
+  }, [isCreate, !isCreate ? props.agent : undefined]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /** Build accumulated patch and send to parent */
   const handleCancel = useCallback(() => {
@@ -464,20 +489,8 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   });
   const [refreshModelsError, setRefreshModelsError] = useState<string | null>(null);
   const [refreshingModels, setRefreshingModels] = useState(false);
-  const rawModels = fetchedModels ?? externalModels ?? [];
+  const models = fetchedModels ?? externalModels ?? [];
   const adapterCommandField = "command";
-  const acpxAgent =
-    adapterType === "acpx_local"
-      ? isCreate
-        ? String(val!.adapterSchemaValues?.agent ?? "claude")
-        : eff("adapterConfig", "agent", String(config.agent ?? "claude"))
-      : "";
-  const models = useMemo(
-    () => adapterType === "acpx_local"
-      ? filterAcpxModelsByAgent(rawModels, acpxAgent)
-      : rawModels,
-    [adapterType, rawModels, acpxAgent],
-  );
   const {
     data: detectedModelData,
     refetch: refetchDetectedModel,
@@ -550,14 +563,14 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       if (adapterConfigPatch) {
         Object.assign(next, adapterConfigPatch);
       }
-      return next;
+      return omitUndefinedEntries(next);
     }
     const base = config as Record<string, unknown>;
     const next = { ...base, ...overlay.adapterConfig };
     if (adapterConfigPatch) {
       Object.assign(next, adapterConfigPatch);
     }
-    return next;
+    return omitUndefinedEntries(next);
   }
 
   function buildCheapAdapterConfigForTest(adapterConfigPatch?: Record<string, unknown>): Record<string, unknown> {
@@ -759,9 +772,10 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   }, [props.onTestFeedbackChange, testActionError, testEnvironment.data, testEnvironment.error]);
 
   // Current model for display
-  const currentModelId = isCreate
-    ? val!.model
+  const currentModelValue = isCreate
+    ? val!.model ?? ""
     : eff("adapterConfig", "model", String(config.model ?? ""));
+  const currentModelId = typeof currentModelValue === "string" ? currentModelValue : "";
 
   async function handleRefreshModels() {
     if (!selectedCompanyId) return;
@@ -780,23 +794,19 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const thinkingEffortKey =
     adapterType === "codex_local"
       ? "modelReasoningEffort"
-      : adapterType === "acpx_local" && acpxAgent === "codex"
-        ? "modelReasoningEffort"
-        : adapterType === "cursor"
-          ? "mode"
-          : adapterType === "opencode_local"
-            ? "variant"
-            : "effort";
+      : adapterType === "cursor"
+        ? "mode"
+        : adapterType === "opencode_local"
+          ? "variant"
+          : "effort";
   const thinkingEffortOptions =
     adapterType === "codex_local"
       ? codexThinkingEffortOptions
-      : adapterType === "acpx_local" && acpxAgent === "codex"
-        ? codexThinkingEffortOptions
-        : adapterType === "cursor"
-          ? cursorModeOptions
-          : adapterType === "opencode_local"
-            ? openCodeThinkingEffortOptions
-            : claudeThinkingEffortOptions;
+      : adapterType === "cursor"
+        ? cursorModeOptions
+        : adapterType === "opencode_local"
+          ? openCodeThinkingEffortOptions
+          : claudeThinkingEffortOptions;
   const currentThinkingEffort = isCreate
     ? val!.thinkingEffort
     : adapterType === "codex_local"
@@ -805,17 +815,11 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
           "modelReasoningEffort",
           String(config.modelReasoningEffort ?? config.reasoningEffort ?? ""),
         )
-      : adapterType === "acpx_local" && acpxAgent === "codex"
-        ? eff(
-            "adapterConfig",
-            "modelReasoningEffort",
-            String(config.modelReasoningEffort ?? config.reasoningEffort ?? config.effort ?? ""),
-          )
-        : adapterType === "cursor"
-          ? eff("adapterConfig", "mode", String(config.mode ?? ""))
-          : adapterType === "opencode_local"
-            ? eff("adapterConfig", "variant", String(config.variant ?? ""))
-            : eff("adapterConfig", "effort", String(config.effort ?? ""));
+      : adapterType === "cursor"
+        ? eff("adapterConfig", "mode", String(config.mode ?? ""))
+        : adapterType === "opencode_local"
+          ? eff("adapterConfig", "variant", String(config.variant ?? ""))
+          : eff("adapterConfig", "effort", String(config.effort ?? ""));
   const showThinkingEffort = adapterType !== "gemini_local" && adapterType !== "cursor_cloud";
   const codexSearchEnabled = adapterType === "codex_local"
     ? (isCreate ? Boolean(val!.search) : eff("adapterConfig", "search", Boolean(config.search)))
@@ -1403,6 +1407,16 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 />
               </Field>
 
+              {!isCreate && (
+                <Field label="Secret access" hint={help.secretAccess}>
+                  <AgentSecretAccessEditor
+                    config={{ ...config, ...overlay.adapterConfig }}
+                    secrets={availableSecrets}
+                    onChange={applyAccessGrants}
+                  />
+                </Field>
+              )}
+
               {/* Edit-only: timeout + grace period */}
               {!isCreate && (
                 <>
@@ -1601,7 +1615,7 @@ export function AdapterEnvironmentResult({ result }: { result: AdapterEnvironmen
 
 /* ---- Internal sub-components ---- */
 
-function AdapterTypeDropdown({
+export function AdapterTypeDropdown({
   value,
   onChange,
   disabledTypes,
@@ -1674,7 +1688,7 @@ function ExperimentalBadge() {
   );
 }
 
-function ModelDropdown({
+export function ModelDropdown({
   models,
   value,
   onChange,
@@ -1871,9 +1885,9 @@ function ModelDropdown({
               <span className="block w-full text-left truncate font-mono text-xs" title={value}>
                 {models.find((m) => m.id === value)?.label ?? value}
               </span>
-              <span className="shrink-0 ml-auto text-(length:--text-nano) font-medium px-1.5 py-0.5 rounded-full bg-green-500/15 text-green-400 border border-green-500/20">
+              <Badge variant="outline" className="ml-auto text-(length:--text-nano) px-1.5 bg-green-500/15 text-green-400 border-green-500/20">
                 current
-              </span>
+              </Badge>
             </button>
           )}
           {detectedModel && detectedModel !== value && (
@@ -1890,9 +1904,9 @@ function ModelDropdown({
               <span className="block w-full text-left truncate font-mono text-xs" title={detectedModel}>
                 {models.find((m) => m.id === detectedModel)?.label ?? detectedModel}
               </span>
-              <span className="shrink-0 ml-auto text-(length:--text-nano) font-medium px-1.5 py-0.5 rounded-full bg-blue-500/15 text-blue-400 border border-blue-500/20">
+              <Badge variant="outline" className="ml-auto text-(length:--text-nano) px-1.5 bg-blue-500/15 text-blue-400 border-blue-500/20">
                 detected
-              </span>
+              </Badge>
             </button>
           )}
           {detectedModelCandidates
@@ -1914,9 +1928,9 @@ function ModelDropdown({
                   <span className="block w-full text-left truncate font-mono text-xs" title={candidate}>
                     {entry?.label ?? candidate}
                   </span>
-                  <span className="shrink-0 ml-auto text-(length:--text-nano) font-medium px-1.5 py-0.5 rounded-full bg-sky-500/15 text-sky-400 border border-sky-500/20">
+                  <Badge variant="outline" className="ml-auto text-(length:--text-nano) px-1.5 bg-sky-500/15 text-sky-400 border-sky-500/20">
                     config
-                  </span>
+                  </Badge>
                 </button>
               );
             })}

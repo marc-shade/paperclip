@@ -36,6 +36,7 @@ import {
   joinPromptSections,
   renderPaperclipWakePrompt,
   stringifyPaperclipWakePayload,
+  isPaperclipRecoveryWakePayload,
 } from "@paperclipai/adapter-utils/server-utils";
 
 import {
@@ -218,7 +219,9 @@ export function buildPrompt(
     paperclipRunIdEnv: "PAPERCLIP_RUN_ID",
   };
 
-  const rendered = renderTemplate(renderConditionalSections(template, vars), vars);
+  const rendered = isPaperclipRecoveryWakePayload(context.paperclipWake)
+    ? ""
+    : renderTemplate(renderConditionalSections(template, vars), vars);
   return joinPromptSections([
     wakePrompt,
     sessionHandoffMarkdown,
@@ -528,7 +531,9 @@ export async function execute(
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
 
-  // BUG FIX: Inject authToken as PAPERCLIP_API_KEY (matches adapter-claude-local behavior)
+  // PAPERCLIP_API_KEY is never accepted from config — the harness-minted run
+  // token is the only source of Paperclip API identity.
+  delete env.PAPERCLIP_API_KEY;
   if ((ctx as any).authToken) env.PAPERCLIP_API_KEY = (ctx as any).authToken;
 
   // BUG FIX: Read task context from ctx.context (wake context), not ctx.config (adapter config)
@@ -593,6 +598,7 @@ export async function execute(
     timeoutSec,
     graceSec,
     onLog: wrappedOnLog,
+    onSpawn: ctx.onSpawn,
   });
 
   // ── Parse output ───────────────────────────────────────────────────────

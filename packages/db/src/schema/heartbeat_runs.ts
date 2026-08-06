@@ -122,7 +122,7 @@ export const heartbeatRuns = pgTable(
     // it the run-listing endpoints sort the whole table and evaluate their
     // context_snapshot projections below the Sort node — a full-table de-TOAST
     // on every call.
-    companyCreatedIdx: index("heartbeat_runs_company_created_idx").on(
+    companyCreatedAtDescIdx: index("heartbeat_runs_company_created_at_desc_idx").on(
       table.companyId,
       table.createdAt.desc(),
     ),
