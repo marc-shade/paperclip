@@ -8,6 +8,10 @@ import {
 } from "./ssh.js";
 import { captureDirectorySnapshot } from "./workspace-restore-merge.js";
 import type { RuntimeProgressSink } from "./runtime-progress.js";
+import {
+  assertSshRemoteWorkspaceCapacity,
+  resolveSshRemoteWorkspacePolicy,
+} from "./remote-workspace-policy.js";
 
 export interface RemoteManagedRuntimeAsset {
   key: string;
@@ -85,6 +89,18 @@ export async function prepareRemoteManagedRuntime(input: {
   );
   const runtimeRootDir = path.posix.join(workspaceRemoteDir, ".paperclip-runtime", input.adapterKey);
 
+  const workspacePolicy = resolveSshRemoteWorkspacePolicy();
+  const capacity = await assertSshRemoteWorkspaceCapacity({
+    spec: input.spec,
+    localDir: input.workspaceLocalDir,
+    remoteDir: workspaceRemoteDir,
+    reserveBytes: workspacePolicy.reserveBytes,
+  });
+  await input.onProgress?.(
+    `[paperclip] Remote workspace capacity gate passed: ${capacity.availableBytes} bytes available; ` +
+    `${capacity.additionalBytes} additional bytes estimated; ${capacity.reserveBytes} bytes reserved.\n`,
+  );
+
   const preparedWorkspace = await prepareWorkspaceForSshExecution({
     spec: input.spec,
     localDir: input.workspaceLocalDir,
@@ -101,6 +117,17 @@ export async function prepareRemoteManagedRuntime(input: {
     for (const asset of input.assets ?? []) {
       const remoteDir = path.posix.join(runtimeRootDir, asset.key);
       assetDirs[asset.key] = remoteDir;
+      const assetCapacity = await assertSshRemoteWorkspaceCapacity({
+        spec: input.spec,
+        localDir: asset.localDir,
+        remoteDir,
+        reserveBytes: workspacePolicy.reserveBytes,
+      });
+      await input.onProgress?.(
+        `[paperclip] Remote asset capacity gate passed for ${asset.key}: ` +
+        `${assetCapacity.availableBytes} bytes available; ${assetCapacity.additionalBytes} additional bytes estimated; ` +
+        `${assetCapacity.reserveBytes} bytes reserved.\n`,
+      );
       await syncDirectoryToSsh({
         spec: input.spec,
         localDir: asset.localDir,

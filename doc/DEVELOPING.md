@@ -331,6 +331,33 @@ If the `codex` CLI is not installed or not on `PATH`, `codex_local` agent runs f
 
 Local adapters require their corresponding CLI/session setup on the machine running Paperclip. External adapters are installed through the adapter/plugin flow and should not require hardcoded imports in `server/` or `ui/`.
 
+### SSH remote workspace capacity and retention
+
+SSH execution materializes each run under
+`<remoteWorkspacePath>/.paperclip-runtime/runs/<run-id>/workspace`. Paperclip
+checks destination free space before copying the workspace and again before
+copying each runtime asset. The copy is refused when its estimated additional
+bytes would cross the configured free-space reserve. Invalid overrides fail
+closed.
+
+- `PAPERCLIP_SSH_WORKSPACE_RESERVE_BYTES` sets the free-space reserve in bytes
+  (default: 1 GiB).
+- `PAPERCLIP_SSH_TERMINAL_WORKSPACE_KEEP_COUNT` sets how many successfully
+  restored, API-terminal run workspaces remain on the execution host (default:
+  1; minimum: 1).
+- `PAPERCLIP_SSH_TERMINAL_WORKSPACE_ARCHIVE_DIR` optionally names an absolute
+  remote path outside the managed runs root. Pruned workspaces are copied there,
+  compared recursively, and only then removed from the runs root.
+
+Retention never infers terminal state from directory age. After a run status is
+persisted as terminal and its workspace restore has succeeded, Paperclip writes
+an exact run-id/status marker. Later retention considers only matching marked
+directories, excludes the current run, refuses paths with open process
+references, and logs every reclaimed source path, archive path, and measured
+byte count as a run event. Unmarked directories and restore-failed workspaces
+are preserved for recovery; the admission reserve prevents them from consuming
+the final reserved bytes.
+
 ## Config Freshness
 
 Agent, project, environment, secret, skill, and workspace config edits are sampled at the next run boundary. A heartbeat that is already running finishes with the config it started with.

@@ -241,6 +241,10 @@ import {
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
+import {
+  finalizeSshTerminalWorkspaceRetention,
+  type RemoteWorkspaceRetentionReceipt,
+} from "@paperclipai/adapter-utils/remote-workspace-policy";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
@@ -14166,6 +14170,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return;
       }
 
+      let remoteWorkspaceRetentionReceipts: RemoteWorkspaceRetentionReceipt[] = [];
+      let remoteWorkspaceRetentionError: string | null = null;
+      if (
+        adapterFinalizeOutcome === "succeeded" &&
+        executionTarget?.kind === "remote" &&
+        executionTarget.transport === "ssh" &&
+        persistedRunWrite.run &&
+        isHeartbeatRunTerminalStatus(persistedRunWrite.run.status)
+      ) {
+        try {
+          remoteWorkspaceRetentionReceipts = await finalizeSshTerminalWorkspaceRetention({
+            spec: executionTarget.spec,
+            runId: persistedRunWrite.run.id,
+            status: persistedRunWrite.run.status,
+            finalizedAt: persistedRunWrite.run.finishedAt ?? new Date(),
+          });
+          for (const receipt of remoteWorkspaceRetentionReceipts) {
+            logger.info(
+              {
+                runId: persistedRunWrite.run.id,
+                reclaimedRunId: receipt.runId,
+                sourcePath: receipt.sourcePath,
+                archivePath: receipt.archivePath,
+                reclaimedBytes: receipt.reclaimedBytes,
+              },
+              "pruned API-terminal SSH workspace after successful restore",
+            );
+          }
+        } catch (retentionErr) {
+          remoteWorkspaceRetentionError = retentionErr instanceof Error
+            ? retentionErr.message
+            : String(retentionErr);
+          logger.warn(
+            { err: retentionErr, runId: persistedRunWrite.run.id },
+            "failed closed while applying SSH terminal-workspace retention",
+          );
+        }
+      }
+
       let persistedRun = persistedRunWrite.run;
       if (persistedRun) {
         persistedRun = await classifyAndPersistRunLiveness(persistedRun, persistedResultJson) ?? persistedRun;
@@ -14178,6 +14221,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const finalizedRun = persistedRun ?? (await getRun(run.id));
       if (finalizedRun) {
+        if (remoteWorkspaceRetentionReceipts.length > 0 || remoteWorkspaceRetentionError) {
+          await appendRunEvent(finalizedRun, seq++, {
+            eventType: "lifecycle",
+            stream: "system",
+            level: remoteWorkspaceRetentionError ? "warn" : "info",
+            message: remoteWorkspaceRetentionError
+              ? "SSH terminal-workspace retention refused or failed"
+              : "SSH terminal-workspace retention completed",
+            payload: {
+              receipts: remoteWorkspaceRetentionReceipts,
+              error: remoteWorkspaceRetentionError,
+            },
+          });
+        }
         await appendRunEvent(finalizedRun, seq++, {
           eventType: "lifecycle",
           stream: "system",
