@@ -347,14 +347,17 @@ closed.
   1; minimum: 1).
 - `PAPERCLIP_SSH_TERMINAL_WORKSPACE_ARCHIVE_DIR` optionally names an absolute
   remote path outside the managed runs root. Pruned workspaces are copied there,
-  compared recursively, and only then removed from the runs root.
+  compared recursively, and only then removed from the runs root. Paperclip
+  applies the same free-space reserve to the archive destination before the
+  copy begins.
 
 Retention never infers terminal state from directory age. After a run status is
 persisted as terminal and its workspace restore has succeeded, Paperclip writes
 an exact run-id/status marker. Later retention considers only matching marked
 directories, excludes the current run, refuses paths with open process
-references, and logs every reclaimed source path, archive path, and measured
-byte count as a run event. Unmarked directories and restore-failed workspaces
+references (including an open descriptor on the run root itself), and logs
+every reclaimed source path, archive path, and measured byte count as a run
+event. Unmarked directories and restore-failed workspaces
 are preserved for recovery; the admission reserve prevents them from consuming
 the final reserved bytes.
 

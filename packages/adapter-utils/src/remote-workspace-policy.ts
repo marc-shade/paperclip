@@ -396,7 +396,11 @@ function buildRemoteWorkspacePruneCommand(input: {
   entry: RemoteTerminalWorkspaceEntry;
   runsRootDir: string;
   archiveDir: string | null;
+  reserveBytes: number;
 }): string {
+  if (!Number.isSafeInteger(input.reserveBytes) || input.reserveBytes < 0) {
+    throw new Error("Remote terminal workspace archive reserve must be a non-negative safe integer");
+  }
   const source = input.entry.runRootDir;
   const marker = path.posix.join(source, ".paperclip-terminal");
   const archivePath = input.archiveDir ? path.posix.join(input.archiveDir, input.entry.runId) : null;
@@ -418,7 +422,7 @@ function buildRemoteWorkspacePruneCommand(input: {
     'for proc_root in /proc/[0-9]*; do',
     '  proc_cwd=$(readlink "$proc_root/cwd" 2>/dev/null || true)',
     '  case "$proc_cwd" in "$source_root"|"$source_root"/*) busy=1; break ;; esac',
-    '  open_fd=$(find "$proc_root/fd" -maxdepth 1 -lname "$source_root/*" -print -quit 2>/dev/null || true)',
+    '  open_fd=$(find "$proc_root/fd" -maxdepth 1 \\( -lname "$source_root" -o -lname "$source_root/*" \\) -print -quit 2>/dev/null || true)',
     '  [ -z "$open_fd" ] || { busy=1; break; }',
     'done',
     '[ "$busy" -eq 0 ] || exit 75',
@@ -428,8 +432,16 @@ function buildRemoteWorkspacePruneCommand(input: {
       ? [
           `archive_path=${shellQuote(archivePath)}`,
           `archive_root=${shellQuote(input.archiveDir!)}`,
-          'mkdir -p "$archive_root"',
+          `reserve_bytes=${input.reserveBytes}`,
           '[ ! -e "$archive_path" ] || exit 77',
+          'archive_anchor="$archive_root"',
+          'while [ ! -e "$archive_anchor" ]; do next=$(dirname "$archive_anchor"); [ "$next" != "$archive_anchor" ] || exit 71; archive_anchor="$next"; done',
+          'available_kib=$(df -Pk "$archive_anchor" | awk \'NR == 2 { print $4 }\')',
+          '[ -n "$available_kib" ] || exit 72',
+          'available_bytes=$((available_kib * 1024))',
+          'required_bytes=$((measured_bytes + reserve_bytes))',
+          '[ "$available_bytes" -ge "$required_bytes" ] || { printf "archive capacity refusal: %s bytes available, %s bytes required\\n" "$available_bytes" "$required_bytes" >&2; exit 78; }',
+          'mkdir -p "$archive_root"',
           'archive_tmp="$archive_root/.paperclip-archive-$expected_run_id-$$"',
           'trap \'rm -rf "$archive_tmp"\' EXIT',
           'cp -a "$source_root" "$archive_tmp"',
@@ -509,6 +521,7 @@ export async function finalizeSshTerminalWorkspaceRetention(input: {
       entry,
       runsRootDir,
       archiveDir: policy.archiveDir,
+      reserveBytes: policy.reserveBytes,
     }));
     receipts.push(parseRetentionReceipt(result.stdout));
   }

@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, open, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -248,6 +248,69 @@ describe("SSH remote workspace policy", () => {
 
     expect(fromA).toEqual([]);
     expect(fromB.map((entry) => entry.runId)).toEqual(["run-a"]);
+  });
+
+  it("refuses to prune a marked terminal workspace with its root directory open", async () => {
+    if (process.platform !== "linux") return;
+    const root = await scratchDir();
+    const oldRoot = await makeRun(root, "run-old", "succeeded");
+    await makeRun(root, "run-current");
+    const handle = await open(oldRoot, "r");
+    try {
+      await expect(finalizeSshTerminalWorkspaceRetention({
+        spec: {
+          host: "fixture",
+          port: 22,
+          username: "fixture",
+          remoteWorkspacePath: root,
+          remoteCwd: root,
+          privateKey: null,
+          knownHosts: null,
+          strictHostKeyChecking: true,
+        },
+        runId: "run-current",
+        status: "succeeded",
+        finalizedAt: new Date(),
+        policy: { reserveBytes: 0, terminalKeepCount: 1, archiveDir: null },
+        runCommand: localShell,
+      })).rejects.toBeDefined();
+      await expect(stat(oldRoot)).resolves.toBeDefined();
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it("checks archive-destination capacity before copying a terminal workspace", async () => {
+    const root = await scratchDir();
+    const archiveDir = path.join(root, "archive");
+    const oldRoot = await makeRun(root, "run-old", "succeeded");
+    await makeRun(root, "run-current");
+    const lowCapacityShell = async (command: string) => {
+      if (!command.includes("archive_anchor=")) return localShell(command);
+      const probe = 'available_kib=$(df -Pk "$archive_anchor" | awk \'NR == 2 { print $4 }\')';
+      expect(command).toContain(probe);
+      return localShell(command.replace(probe, "available_kib=0"));
+    };
+
+    await expect(finalizeSshTerminalWorkspaceRetention({
+      spec: {
+        host: "fixture",
+        port: 22,
+        username: "fixture",
+        remoteWorkspacePath: root,
+        remoteCwd: root,
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+      runId: "run-current",
+      status: "succeeded",
+      finalizedAt: new Date(),
+      policy: { reserveBytes: 1024, terminalKeepCount: 1, archiveDir },
+      runCommand: lowCapacityShell,
+    })).rejects.toBeDefined();
+    await expect(stat(oldRoot)).resolves.toBeDefined();
+    await expect(stat(path.join(archiveDir, "run-old"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("archives exact terminal paths before reclaiming and bounds repeated materialization", async () => {
