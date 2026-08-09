@@ -96,26 +96,36 @@ export function resolveSshRemoteWorkspacePolicy(
 
 export async function estimateLocalDirectoryBytes(input: {
   localDir: string;
-  excludeNames?: string[];
+  exclude?: string[];
+  followSymlinks?: boolean;
 }): Promise<number> {
-  const excluded = new Set(["._*", ...(input.excludeNames ?? [])]);
+  const regexes = ["._*", ...(input.exclude ?? [])].map((pattern) => {
+    const escaped = pattern
+      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+      .replace(/\*/g, "[^/]*")
+      .replace(/\?/g, "[^/]");
+    return new RegExp(`^${escaped}$`);
+  });
+  const isExcluded = (relativePath: string, baseName: string) =>
+    regexes.some((regex) => regex.test(relativePath) || regex.test(baseName));
   let total = 0;
 
-  const walk = async (dir: string): Promise<void> => {
+  const walk = async (dir: string, relative: string): Promise<void> => {
     const entries = await fs.readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
-      if (entry.name.startsWith("._") || excluded.has(entry.name)) continue;
+      const entryRelative = relative ? `${relative}/${entry.name}` : entry.name;
+      if (isExcluded(entryRelative, entry.name)) continue;
       const fullPath = path.join(dir, entry.name);
-      const stat = await fs.lstat(fullPath);
+      const stat = await (input.followSymlinks ? fs.stat(fullPath) : fs.lstat(fullPath));
       if (stat.isDirectory()) {
-        await walk(fullPath);
+        await walk(fullPath, entryRelative);
       } else if (stat.isFile()) {
         total += stat.size;
       }
     }
   };
 
-  await walk(input.localDir);
+  await walk(input.localDir, "");
   return total;
 }
 
@@ -159,6 +169,8 @@ export async function assertSshRemoteWorkspaceCapacity(input: {
   localDir: string;
   remoteDir: string;
   reserveBytes: number;
+  exclude?: string[];
+  followSymlinks?: boolean;
   runCommand?: RemoteCommandRunner;
 }): Promise<RemoteWorkspaceCapacityDecision> {
   const estimatedWorkspaceBytes = await estimateLocalDirectoryBytes({
@@ -167,7 +179,8 @@ export async function assertSshRemoteWorkspaceCapacity(input: {
     // workspace overlay. Counting .git may overestimate compressed transfer
     // bytes, but it keeps the admission decision fail-closed for the extracted
     // remote footprint.
-    excludeNames: [".paperclip-runtime"],
+    exclude: [".paperclip-runtime", ...(input.exclude ?? [])],
+    followSymlinks: input.followSymlinks,
   });
   const command = [
     "set -eu",

@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -95,8 +95,27 @@ describe("SSH remote workspace policy", () => {
 
     await expect(estimateLocalDirectoryBytes({
       localDir: root,
-      excludeNames: [".git", ".paperclip-runtime"],
+      exclude: [".git", ".paperclip-runtime"],
     })).resolves.toBe(5);
+  });
+
+  it("counts dereferenced asset symlinks and honors transfer excludes", async () => {
+    const root = await scratchDir();
+    const referenced = await scratchDir();
+    await writeFile(path.join(referenced, "payload.bin"), "x".repeat(4096));
+    await writeFile(path.join(root, "ignored.bin"), "x".repeat(2048));
+    await symlink(referenced, path.join(root, "linked-assets"));
+
+    await expect(estimateLocalDirectoryBytes({
+      localDir: root,
+      exclude: ["ignored.bin"],
+      followSymlinks: false,
+    })).resolves.toBe(0);
+    await expect(estimateLocalDirectoryBytes({
+      localDir: root,
+      exclude: ["ignored.bin"],
+      followSymlinks: true,
+    })).resolves.toBe(4096);
   });
 
   it("runs the reserve probe before materialization and reports a refusal", async () => {

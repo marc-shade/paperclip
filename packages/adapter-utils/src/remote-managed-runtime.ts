@@ -122,6 +122,8 @@ export async function prepareRemoteManagedRuntime(input: {
         localDir: asset.localDir,
         remoteDir,
         reserveBytes: workspacePolicy.reserveBytes,
+        exclude: asset.exclude,
+        followSymlinks: asset.followSymlinks,
       });
       await input.onProgress?.(
         `[paperclip] Remote asset capacity gate passed for ${asset.key}: ` +
