@@ -11,6 +11,7 @@ import {
   evaluateRemoteWorkspaceCapacity,
   finalizeSshTerminalWorkspaceRetention,
   resolveSshRemoteWorkspacePolicy,
+  selectTerminalWorkspacePruneCandidates,
   terminalWorkspaceMarker,
 } from "./remote-workspace-policy.js";
 
@@ -219,6 +220,34 @@ describe("SSH remote workspace policy", () => {
     expect(second).toEqual([]);
     await expect(stat(activeRoot)).resolves.toBeDefined();
     await expect(stat(currentRoot)).resolves.toBeDefined();
+  });
+
+  it("uses one deterministic keep set across concurrent finalizers", () => {
+    const runsRootDir = "/remote/.paperclip-runtime/runs";
+    const entries = ["run-a", "run-b"].map((runId) => ({
+      runId,
+      markerRunId: runId,
+      status: "succeeded",
+      finalizedAtEpochMs: 100,
+      measuredBytes: 1024,
+      runRootDir: path.posix.join(runsRootDir, runId),
+    }));
+
+    const fromA = selectTerminalWorkspacePruneCandidates({
+      entries,
+      currentRunId: "run-a",
+      keepCount: 1,
+      runsRootDir,
+    });
+    const fromB = selectTerminalWorkspacePruneCandidates({
+      entries,
+      currentRunId: "run-b",
+      keepCount: 1,
+      runsRootDir,
+    });
+
+    expect(fromA).toEqual([]);
+    expect(fromB.map((entry) => entry.runId)).toEqual(["run-a"]);
   });
 
   it("archives exact terminal paths before reclaiming and bounds repeated materialization", async () => {

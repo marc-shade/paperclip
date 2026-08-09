@@ -40,7 +40,7 @@ export interface RemoteTerminalWorkspaceEntry {
   runId: string;
   markerRunId: string;
   status: string;
-  finalizedAtEpochSec: number;
+  finalizedAtEpochMs: number;
   measuredBytes: number;
   runRootDir: string;
 }
@@ -328,10 +328,10 @@ export function buildRemoteTerminalWorkspaceInventoryCommand(runsRootDir: string
     '  run_id=${run_root##*/}',
     '  marker_run_id=$(sed -n \'s/^run_id=//p\' "$marker" | head -n 1)',
     '  marker_status=$(sed -n \'s/^status=//p\' "$marker" | head -n 1)',
-    '  finalized_epoch=$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker")',
+    '  finalized_at=$(sed -n \'s/^finalized_at=//p\' "$marker" | head -n 1)',
     '  measured_bytes=$(du -sb "$run_root" 2>/dev/null | awk \'{ print $1 }\' || true)',
     '  if [ -z "$measured_bytes" ]; then measured_bytes=$(( $(du -sk "$run_root" | awk \'{ print $1 }\') * 1024 )); fi',
-    '  printf "workspace\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n" "$run_id" "$marker_run_id" "$marker_status" "$finalized_epoch" "$measured_bytes" "$run_root"',
+    '  printf "workspace\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n" "$run_id" "$marker_run_id" "$marker_status" "$finalized_at" "$measured_bytes" "$run_root"',
     'done',
   ].join("\n");
 }
@@ -345,16 +345,16 @@ export function parseRemoteTerminalWorkspaceInventory(stdout: string): RemoteTer
       if (fields.length !== 7 || fields[0] !== "workspace") {
         throw new Error(`Invalid remote workspace inventory receipt: ${JSON.stringify(line)}`);
       }
-      const finalizedAtEpochSec = Number(fields[4]);
+      const finalizedAtEpochMs = Date.parse(fields[4]!);
       const measuredBytes = Number(fields[5]);
-      if (!Number.isSafeInteger(finalizedAtEpochSec) || !Number.isSafeInteger(measuredBytes)) {
+      if (!Number.isSafeInteger(finalizedAtEpochMs) || !Number.isSafeInteger(measuredBytes)) {
         throw new Error(`Invalid numeric remote workspace inventory receipt: ${JSON.stringify(line)}`);
       }
       return {
         runId: fields[1]!,
         markerRunId: fields[2]!,
         status: fields[3]!,
-        finalizedAtEpochSec,
+        finalizedAtEpochMs,
         measuredBytes,
         runRootDir: fields[6]!,
       };
@@ -371,22 +371,25 @@ export function selectTerminalWorkspacePruneCandidates(input: {
     throw new Error("Remote terminal workspace keep count must be >= 1");
   }
   const rootPrefix = input.runsRootDir.endsWith("/") ? input.runsRootDir : `${input.runsRootDir}/`;
-  const eligible = input.entries.filter((entry) =>
-    entry.runId !== input.currentRunId &&
+  const terminal = input.entries.filter((entry) =>
     entry.markerRunId === entry.runId &&
     TERMINAL_RUN_STATUSES.has(entry.status) &&
     entry.runRootDir === path.posix.join(input.runsRootDir, entry.runId) &&
     entry.runRootDir.startsWith(rootPrefix),
   );
-  const terminalCount = input.entries.filter((entry) =>
-    entry.markerRunId === entry.runId &&
-    TERMINAL_RUN_STATUSES.has(entry.status) &&
-    entry.runRootDir === path.posix.join(input.runsRootDir, entry.runId),
-  ).length;
-  const pruneCount = Math.max(0, terminalCount - input.keepCount);
-  return eligible
-    .sort((a, b) => a.finalizedAtEpochSec - b.finalizedAtEpochSec || a.runId.localeCompare(b.runId))
-    .slice(0, pruneCount);
+  const newestFirst = [...terminal].sort((a, b) =>
+    b.finalizedAtEpochMs - a.finalizedAtEpochMs || b.runId.localeCompare(a.runId),
+  );
+  const retainedRunIds = new Set(newestFirst.slice(0, input.keepCount).map((entry) => entry.runId));
+
+  // Compute one global deterministic keep set before excluding this finalizer's
+  // workspace. If two runs finalize in the same second, each invocation then
+  // agrees which terminal tree survives instead of selecting the other run and
+  // pruning both. A current run outside the keep set remains fail-closed until
+  // a later finalizer can safely reconcile the extra retained tree.
+  return newestFirst
+    .filter((entry) => entry.runId !== input.currentRunId && !retainedRunIds.has(entry.runId))
+    .reverse();
 }
 
 function buildRemoteWorkspacePruneCommand(input: {
