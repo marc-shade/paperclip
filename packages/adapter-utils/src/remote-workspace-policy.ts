@@ -1,5 +1,7 @@
+import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { promisify } from "node:util";
 import {
   runSshCommand,
   shellQuote,
@@ -51,6 +53,7 @@ export interface RemoteWorkspaceRetentionReceipt {
 }
 
 type RemoteCommandRunner = (command: string) => Promise<SshCommandResult>;
+const execFileAsync = promisify(execFile);
 
 function parseUnsignedIntegerEnv(
   env: NodeJS.ProcessEnv,
@@ -129,6 +132,75 @@ export async function estimateLocalDirectoryBytes(input: {
   return total;
 }
 
+async function measureDirectoryTreeBytes(root: string, visited = new Set<string>()): Promise<number> {
+  const realRoot = await fs.realpath(root);
+  if (visited.has(realRoot)) return 0;
+  visited.add(realRoot);
+
+  let total = 0;
+  const entries = await fs.readdir(realRoot, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = path.join(realRoot, entry.name);
+    const stat = await fs.stat(fullPath);
+    if (stat.isDirectory()) {
+      total += await measureDirectoryTreeBytes(fullPath, visited);
+    } else if (stat.isFile()) {
+      total += stat.size;
+    }
+  }
+  return total;
+}
+
+export async function estimateLocalGitMaterializationBytes(localDir: string): Promise<number> {
+  try {
+    await execFileAsync(
+      "git",
+      ["-C", localDir, "rev-parse", "--is-inside-work-tree"],
+      { timeout: 30_000, maxBuffer: 16 * 1024 },
+    );
+  } catch {
+    return 0;
+  }
+
+  let gitCommonDir: string;
+  try {
+    const result = await execFileAsync(
+      "git",
+      ["-C", localDir, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { timeout: 30_000, maxBuffer: 16 * 1024 },
+    );
+    gitCommonDir = result.stdout.trim();
+  } catch (error) {
+    throw new Error(
+      `Unable to resolve Git object storage for SSH capacity admission: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (!gitCommonDir) {
+    throw new Error("Unable to resolve Git object storage for SSH capacity admission: empty common dir");
+  }
+
+  const objectsDir = path.join(gitCommonDir, "objects");
+  let objectBytes = await measureDirectoryTreeBytes(objectsDir);
+  const alternatesPath = path.join(objectsDir, "info", "alternates");
+  const alternates = await fs.readFile(alternatesPath, "utf8").catch(() => "");
+  const visited = new Set<string>([await fs.realpath(objectsDir)]);
+  for (const entry of alternates.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)) {
+    const alternateDir = path.isAbsolute(entry) ? entry : path.resolve(objectsDir, entry);
+    objectBytes += await measureDirectoryTreeBytes(alternateDir, visited);
+  }
+
+  // Peak remote materialization briefly holds both the uploaded bundle and the
+  // fetched object database. The checkout itself is counted separately by the
+  // ordinary workspace walk below. Object-store bytes are a conservative upper
+  // bound for each compressed copy and avoid the tiny `.git` pointer-file trap
+  // in standard worktrees.
+  const peakGitBytes = objectBytes * 2;
+  if (!Number.isSafeInteger(peakGitBytes)) {
+    throw new Error("Local Git materialization estimate exceeded safe integer range");
+  }
+  return peakGitBytes;
+}
+
 export function evaluateRemoteWorkspaceCapacity(input: {
   availableBytes: number;
   estimatedWorkspaceBytes: number;
@@ -171,17 +243,25 @@ export async function assertSshRemoteWorkspaceCapacity(input: {
   reserveBytes: number;
   exclude?: string[];
   followSymlinks?: boolean;
+  includeGitHistory?: boolean;
   runCommand?: RemoteCommandRunner;
 }): Promise<RemoteWorkspaceCapacityDecision> {
-  const estimatedWorkspaceBytes = await estimateLocalDirectoryBytes({
+  const gitMaterializationBytes = input.includeGitHistory
+    ? await estimateLocalGitMaterializationBytes(input.localDir)
+    : 0;
+  const ordinaryWorkspaceBytes = await estimateLocalDirectoryBytes({
     localDir: input.localDir,
-    // Git-backed SSH materialization sends history as a bundle before the
-    // workspace overlay. Counting .git may overestimate compressed transfer
-    // bytes, but it keeps the admission decision fail-closed for the extracted
-    // remote footprint.
-    exclude: [".paperclip-runtime", ...(input.exclude ?? [])],
+    exclude: [
+      ".paperclip-runtime",
+      ...(gitMaterializationBytes > 0 ? [".git"] : []),
+      ...(input.exclude ?? []),
+    ],
     followSymlinks: input.followSymlinks,
   });
+  const estimatedWorkspaceBytes = ordinaryWorkspaceBytes + gitMaterializationBytes;
+  if (!Number.isSafeInteger(estimatedWorkspaceBytes)) {
+    throw new Error("Local workspace materialization estimate exceeded safe integer range");
+  }
   const command = [
     "set -eu",
     `target=${shellQuote(input.remoteDir)}`,

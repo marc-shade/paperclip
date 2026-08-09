@@ -95,6 +95,7 @@ export async function prepareRemoteManagedRuntime(input: {
     localDir: input.workspaceLocalDir,
     remoteDir: workspaceRemoteDir,
     reserveBytes: workspacePolicy.reserveBytes,
+    includeGitHistory: true,
   });
   await input.onProgress?.(
     `[paperclip] Remote workspace capacity gate passed: ${capacity.availableBytes} bytes available; ` +

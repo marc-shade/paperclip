@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   assertSshRemoteWorkspaceCapacity,
   estimateLocalDirectoryBytes,
+  estimateLocalGitMaterializationBytes,
   evaluateRemoteWorkspaceCapacity,
   finalizeSshTerminalWorkspaceRetention,
   resolveSshRemoteWorkspacePolicy,
@@ -116,6 +117,44 @@ describe("SSH remote workspace policy", () => {
       exclude: ["ignored.bin"],
       followSymlinks: true,
     })).resolves.toBe(4096);
+  });
+
+  it("accounts for Git worktree objects instead of only the .git pointer", async () => {
+    const repository = await scratchDir();
+    const worktreeParent = await scratchDir();
+    const root = path.join(worktreeParent, "workspace");
+    await execFileAsync("git", ["init", "-q", repository]);
+    await writeFile(path.join(repository, "tracked.txt"), "tracked payload\n", "utf8");
+    await execFileAsync("git", ["-C", repository, "add", "tracked.txt"]);
+    await execFileAsync("git", [
+      "-C", repository,
+      "-c", "user.name=Paperclip Test",
+      "-c", "user.email=paperclip-test@example.invalid",
+      "commit", "-qm", "fixture",
+    ]);
+    await execFileAsync("git", ["-C", repository, "worktree", "add", "-q", "--detach", root]);
+    expect((await stat(path.join(root, ".git"))).isFile()).toBe(true);
+
+    const gitBytes = await estimateLocalGitMaterializationBytes(root);
+    expect(gitBytes).toBeGreaterThan(0);
+    const decision = await assertSshRemoteWorkspaceCapacity({
+      spec: {
+        host: "fixture",
+        port: 22,
+        username: "fixture",
+        remoteWorkspacePath: root,
+        remoteCwd: root,
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+      localDir: root,
+      remoteDir: path.join(root, "target"),
+      reserveBytes: 0,
+      includeGitHistory: true,
+      runCommand: async () => ({ stdout: "capacity\t1000000000\t0\n", stderr: "" }),
+    });
+    expect(decision.estimatedWorkspaceBytes).toBeGreaterThan(gitBytes);
   });
 
   it("runs the reserve probe before materialization and reports a refusal", async () => {
