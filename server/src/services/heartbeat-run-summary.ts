@@ -39,7 +39,8 @@ const HEARTBEAT_RUN_RESULT_PRIORITY_TEXT_FIELDS = new Set([
   "errorMessage",
 ]);
 const HEARTBEAT_RUN_RESULT_MAX_RETAINED_TOP_LEVEL_FIELDS = 500;
-const HEARTBEAT_RUN_RESULT_MAX_OMITTED_FIELD_NAME_BYTES = 256;
+const HEARTBEAT_RUN_RESULT_MAX_LISTED_OMITTED_TOP_LEVEL_FIELDS = 100;
+const HEARTBEAT_RUN_RESULT_MAX_OMITTED_FIELD_IDENTIFIER_JSON_BYTES = 256;
 
 export interface HeartbeatRunResultLogReceipt {
   store: string;
@@ -86,8 +87,8 @@ export function planHeartbeatRunResultRetention(
 function retentionMarker(input: {
   plan: HeartbeatRunResultRetentionPlan;
   receipt: HeartbeatRunResultLogReceipt;
-  omittedFieldIdentifiers: string[];
-  omittedFieldCount: number;
+  omittedStreamIdentifiers: string[];
+  omittedTopLevelFieldIdentifiers: string[];
 }) {
   return {
     version: HEARTBEAT_RUN_RESULT_RETENTION_VERSION,
@@ -96,8 +97,15 @@ function retentionMarker(input: {
     originalBytes: input.plan.originalBytes,
     originalSha256: input.plan.originalSha256,
     streamBytes: input.plan.streamBytes,
-    omittedFields: input.omittedFieldIdentifiers.slice(0, 100),
-    omittedFieldCount: input.omittedFieldCount,
+    omittedFields: [
+      ...input.omittedStreamIdentifiers,
+      ...input.omittedTopLevelFieldIdentifiers.slice(
+        0,
+        HEARTBEAT_RUN_RESULT_MAX_LISTED_OMITTED_TOP_LEVEL_FIELDS,
+      ),
+    ],
+    omittedFieldCount:
+      input.omittedStreamIdentifiers.length + input.omittedTopLevelFieldIdentifiers.length,
     custody: {
       kind: "heartbeat_run_log",
       store: input.receipt.store,
@@ -110,8 +118,26 @@ function retentionMarker(input: {
   };
 }
 
-function contentAddressOversizedFieldName(field: string) {
-  if (Buffer.byteLength(field, "utf8") <= HEARTBEAT_RUN_RESULT_MAX_OMITTED_FIELD_NAME_BYTES) {
+function isPostgresJsonbFieldNameSafe(field: string) {
+  for (let index = 0; index < field.length; index += 1) {
+    const codeUnit = field.charCodeAt(index);
+    if (codeUnit === 0) return false;
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const nextCodeUnit = field.charCodeAt(index + 1);
+      if (!(nextCodeUnit >= 0xdc00 && nextCodeUnit <= 0xdfff)) return false;
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function contentAddressUnsafeOrOversizedFieldName(field: string) {
+  if (
+    isPostgresJsonbFieldNameSafe(field) &&
+    jsonBytes(field) <= HEARTBEAT_RUN_RESULT_MAX_OMITTED_FIELD_IDENTIFIER_JSON_BYTES
+  ) {
     return field;
   }
   return `sha256:${createHash("sha256").update(field).digest("hex")}`;
@@ -143,12 +169,18 @@ export function boundHeartbeatRunResultJsonForStorage(input: {
       omittedStreams.push(field);
     }
   }
+  const omittedUnsafeTopLevelFieldIdentifiers: string[] = [];
+  for (const key of Object.keys(withoutStreams)) {
+    if (isPostgresJsonbFieldNameSafe(key)) continue;
+    delete withoutStreams[key];
+    omittedUnsafeTopLevelFieldIdentifiers.push(contentAddressUnsafeOrOversizedFieldName(key));
+  }
 
   const streamOnlyMarker = retentionMarker({
     plan: input.plan,
     receipt: input.receipt,
-    omittedFieldIdentifiers: omittedStreams,
-    omittedFieldCount: omittedStreams.length,
+    omittedStreamIdentifiers: omittedStreams,
+    omittedTopLevelFieldIdentifiers: omittedUnsafeTopLevelFieldIdentifiers,
   });
   const streamCompacted = {
     ...withoutStreams,
@@ -161,23 +193,27 @@ export function boundHeartbeatRunResultJsonForStorage(input: {
   const sourceEntries = Object.entries(withoutStreams);
   const sourceKeys = sourceEntries.map(([key]) => key);
   const sourceFieldIdentifiers = new Map(
-    sourceKeys.map((key) => [key, contentAddressOversizedFieldName(key)]),
+    sourceKeys.map((key) => [key, contentAddressUnsafeOrOversizedFieldName(key)]),
   );
-  const worstCaseOmittedFieldIdentifiers = [
-    ...omittedStreams,
+  const worstCaseOmittedTopLevelFieldIdentifiers = [
+    ...omittedUnsafeTopLevelFieldIdentifiers,
     ...sourceKeys.map((key) => sourceFieldIdentifiers.get(key)!),
   ];
 
   const tryRetain = (key: string, value: unknown) => {
     if (retainedKeys.has(key)) return;
+    // A content-addressed name is not safe to copy into the JSONB row. Besides
+    // its serialized size, PostgreSQL rejects some otherwise valid JSON key
+    // shapes (notably strings containing NUL) during jsonb input conversion.
+    if (sourceFieldIdentifiers.get(key) !== key) return;
     const nextRetained = { ...retained, [key]: value };
     const candidate = {
       ...nextRetained,
       [HEARTBEAT_RUN_RESULT_RETENTION_FIELD]: retentionMarker({
         plan: input.plan,
         receipt: input.receipt,
-        omittedFieldIdentifiers: worstCaseOmittedFieldIdentifiers,
-        omittedFieldCount: worstCaseOmittedFieldIdentifiers.length,
+        omittedStreamIdentifiers: omittedStreams,
+        omittedTopLevelFieldIdentifiers: worstCaseOmittedTopLevelFieldIdentifiers,
       }),
     };
     if (!fitsResultJsonLimit(candidate)) return;
@@ -199,8 +235,8 @@ export function boundHeartbeatRunResultJsonForStorage(input: {
     tryRetain(key, value);
   }
 
-  const omittedFieldIdentifiers = [
-    ...omittedStreams,
+  const omittedTopLevelFieldIdentifiers = [
+    ...omittedUnsafeTopLevelFieldIdentifiers,
     ...sourceKeys
       .filter((key) => !retainedKeys.has(key))
       .map((key) => sourceFieldIdentifiers.get(key)!),
@@ -210,8 +246,8 @@ export function boundHeartbeatRunResultJsonForStorage(input: {
     [HEARTBEAT_RUN_RESULT_RETENTION_FIELD]: retentionMarker({
       plan: input.plan,
       receipt: input.receipt,
-      omittedFieldIdentifiers,
-      omittedFieldCount: omittedFieldIdentifiers.length,
+      omittedStreamIdentifiers: omittedStreams,
+      omittedTopLevelFieldIdentifiers,
     }),
   };
 

@@ -292,4 +292,91 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
       unregisterServerAdapter(adapterType);
     }
   });
+
+  it("keeps a successful run successful for 100 JSON-escaped omitted field names", async () => {
+    const adapterType = `escaped_result_keys_${randomUUID()}`;
+    const escapedKeys = Array.from(
+      { length: 100 },
+      (_, index) => `${String(index).padStart(3, "0")}${"\0".repeat(250)}`,
+    );
+    const resultJson = Object.fromEntries([
+      ["stdout", "x".repeat(70_000)],
+      ...escapedKeys.map((key) => [key, 1] as const),
+    ]);
+    registerServerAdapter({
+      type: adapterType,
+      execute: async () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        resultJson,
+      }),
+      testEnvironment: async () => ({
+        adapterType,
+        status: "pass",
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    });
+
+    try {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "EscapedResultKeysAgent",
+        role: "engineer",
+        status: "idle",
+        adapterType,
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      const heartbeat = heartbeatService(db);
+      const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+      expect(queued).not.toBeNull();
+
+      const finished = await waitForRunToFinish(heartbeat, queued!.id);
+      expect(finished?.status).toBe("succeeded");
+
+      const [stored] = await db
+        .select({
+          status: heartbeatRuns.status,
+          resultJson: heartbeatRuns.resultJson,
+          resultJsonBytes: sql<number>`octet_length(${heartbeatRuns.resultJson}::text)`,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, queued!.id));
+      expect(stored?.status).toBe("succeeded");
+      expect(Number(stored?.resultJsonBytes)).toBeLessThanOrEqual(
+        HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
+      );
+
+      const storedResultJson = stored?.resultJson as Record<string, unknown>;
+      const retention = storedResultJson.paperclipResultRetention as Record<string, unknown>;
+      const expectedIdentifiers = escapedKeys.map(
+        (key) => `sha256:${createHash("sha256").update(key).digest("hex")}`,
+      );
+      expect(retention.omittedFields).toEqual(["stdout", ...expectedIdentifiers]);
+      expect(retention.omittedFieldCount).toBe(101);
+      expect(escapedKeys.every((key) => !(key in storedResultJson))).toBe(true);
+      // The heartbeat service adds stop/config metadata before fingerprinting;
+      // the direct regression above binds the exact adapter-payload digest.
+      expect(retention.originalSha256).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/));
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    } finally {
+      unregisterServerAdapter(adapterType);
+    }
+  });
 });

@@ -15,6 +15,35 @@ without discarding audit custody. The existing run log remains the authoritative
 stdout/stderr record and is already exposed through the authenticated heartbeat
 run-log API with a relative ref, byte count, and SHA-256.
 
+## ARC-5678 corrective delta
+
+The ARC-5676 re-audit found that the first correction measured omitted names by
+raw UTF-8 bytes. A 253-byte name containing 250 NUL characters costs 1,505 bytes
+after JSON escaping, so 100 verbatim identifiers could still overflow the
+receipt. ARC-5678 now measures the serialized JSON cost, content-addresses names
+that exceed 256 serialized bytes, and never copies content-addressed names back
+as PostgreSQL `jsonb` keys. NUL-bearing and unpaired-surrogate names are always
+content-addressed because PostgreSQL cannot represent them as `jsonb` strings.
+
+The exact direct reproducer is 220,813 bytes before compaction and 7,941 bytes
+after compaction. Its 100 adapter keys are each 253 raw UTF-8 bytes / 1,505 JSON
+bytes; the receipt contains `stdout` plus all 100 exact `sha256:<digest>`
+identifiers (`omittedFieldCount=101`).
+
+Focused verification on the isolated corrective tree:
+
+- `heartbeat-run-summary.test.ts`: PASS, 14/14.
+- Selected embedded-Postgres heartbeat regression: PASS, 1/1 with 3 skipped;
+  it asserts raw status `succeeded`, all 100 exact identifiers, and
+  `octet_length(result_json::text) <= 65,536`.
+- `pnpm --filter @paperclipai/server typecheck`: PASS.
+- `/Users/marc/ARC-AGI-3/.venv/bin/python scripts/integration_audit.py --strict`:
+  PASS, `ORPHAN=0`.
+
+These checks authorize no rollout. The exact corrective commit/tree and pushed
+remote ref are recorded in the ARC-5678 issue handoff and must be independently
+re-derived by Feynman before the result can be banked.
+
 ## Writer and reader map
 
 - Writer: `server/src/services/heartbeat.ts` finalizes the adapter, finalizes the
@@ -42,10 +71,17 @@ the object unchanged. For an oversized object:
 4. Persist a marker containing policy version, original byte count and SHA-256,
    stdout/stderr byte counts, omitted keys, and the run-log store/ref/bytes/hash.
 
-Omitted field identifiers are themselves bounded: names at most 256 UTF-8 bytes
-remain readable verbatim, while longer names become `sha256:<digest>`. This
-keeps the receipt size independent of adapter-controlled key length while still
-providing a content-addressed identity for every listed key.
+Omitted field identifiers are themselves bounded: names whose serialized JSON
+string costs at most 256 UTF-8 bytes remain readable verbatim, while names with
+a larger serialized cost become `sha256:<digest>`. The serialized check is
+load-bearing because short raw names can expand sixfold through JSON escaping.
+Names containing NUL or unpaired UTF-16 surrogates are content-addressed at any
+length because PostgreSQL `jsonb` rejects those otherwise JSON-serializable keys.
+Known stream names are listed separately from up to 100 adapter-controlled names,
+and content-addressed names are never copied back as JSONB keys. The 100-key
+regression therefore retains the exact content address of every omitted key.
+This keeps the receipt size independent of adapter-controlled key shape and
+avoids PostgreSQL's rejection of JSON strings containing NUL.
 
 The marker is explicit; callers never mistake a compacted object for a complete
 legacy result.
@@ -129,6 +165,13 @@ the receipt. A key over 65,536 bytes previously made compaction throw during
 finalization and converted an otherwise successful run into a failed run. The
 regression suite now executes that shape through the heartbeat service, asserts
 the run remains `succeeded`, and inspects the raw stored JSON byte count.
+
+A fourth misfire is bounding identifiers by raw UTF-8 length while ignoring JSON
+escaping. ARC-5678 reproduces that case with 100 unique 253-byte names, each made
+from three ASCII digits plus 250 NUL characters. Each name serializes to 1,505
+JSON bytes. Direct and embedded-Postgres regressions require all 100 names to be
+content-addressed, require the database run to remain `succeeded`, and measure
+`octet_length(result_json::text) <= 65,536` on the raw stored row.
 
 ## Blind spots considered
 

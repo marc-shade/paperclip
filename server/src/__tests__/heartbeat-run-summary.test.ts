@@ -203,4 +203,55 @@ describe("boundHeartbeatRunResultJsonForStorage", () => {
       HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
     );
   });
+
+  it("bounds omitted identifiers by serialized bytes for JSON-escaped field names", () => {
+    const escapedKeys = Array.from(
+      { length: 100 },
+      (_, index) => `${String(index).padStart(3, "0")}${"\0".repeat(250)}`,
+    );
+    const resultJson = Object.fromEntries([
+      ["stdout", "x".repeat(70_000)],
+      ...escapedKeys.map((key) => [key, 1] as const),
+    ]);
+    expect(Buffer.byteLength(escapedKeys[0]!, "utf8")).toBe(253);
+    expect(Buffer.byteLength(JSON.stringify(escapedKeys[0]), "utf8")).toBe(1_505);
+    const plan = planHeartbeatRunResultRetention(resultJson)!;
+
+    const bounded = boundHeartbeatRunResultJsonForStorage({ resultJson, plan, receipt });
+    const marker = bounded.paperclipResultRetention as Record<string, unknown>;
+    const expectedIdentifiers = escapedKeys.map(
+      (key) => `sha256:${createHash("sha256").update(key).digest("hex")}`,
+    );
+
+    expect(marker.omittedFields).toEqual(["stdout", ...expectedIdentifiers]);
+    expect(marker.omittedFieldCount).toBe(101);
+    expect(escapedKeys.every((key) => !(key in bounded))).toBe(true);
+    expect(marker.originalSha256).toBe(
+      createHash("sha256").update(JSON.stringify(resultJson)).digest("hex"),
+    );
+    expect(Buffer.byteLength(JSON.stringify(bounded), "utf8")).toBeLessThanOrEqual(
+      HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
+    );
+  });
+
+  it("content-addresses short JSON keys that PostgreSQL jsonb cannot represent", () => {
+    const unsafeKeys = ["nul\0key", "lone-high-\ud800", "lone-low-\udc00"];
+    const resultJson = Object.fromEntries([
+      ["stdout", "x".repeat(70_000)],
+      ...unsafeKeys.map((key) => [key, 1] as const),
+    ]);
+    const plan = planHeartbeatRunResultRetention(resultJson)!;
+
+    const bounded = boundHeartbeatRunResultJsonForStorage({ resultJson, plan, receipt });
+    const marker = bounded.paperclipResultRetention as Record<string, unknown>;
+    const expectedIdentifiers = unsafeKeys.map(
+      (key) => `sha256:${createHash("sha256").update(key).digest("hex")}`,
+    );
+
+    expect(marker.omittedFields).toEqual(["stdout", ...expectedIdentifiers]);
+    expect(unsafeKeys.every((key) => !(key in bounded))).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(bounded), "utf8")).toBeLessThanOrEqual(
+      HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
+    );
+  });
 });
