@@ -177,6 +177,30 @@ Both tables use a unique key on `(company_id, user_id, resource_id)` and keep `s
 
 This policy makes training exports self-describing while keeping the decision record usable after a comment deletion without retaining content the author removed.
 
+## Heartbeat result retention
+
+Terminal heartbeat output has two storage paths with different jobs:
+
+- `heartbeat_runs.result_json` is a bounded structured summary used by run,
+  recovery, liveness, and issue-comment APIs.
+- The run log is the audit-custody record for stdout/stderr. It is available from
+  `GET /api/heartbeat-runs/:runId/log` and is bound to the run by `log_store`,
+  `log_ref`, `log_bytes`, and `log_sha256`.
+
+New terminal writes keep small result objects unchanged. When the compact JSON
+encoding exceeds 64 KiB, Paperclip removes duplicated `stdout` and `stderr`,
+preserves operational fields, and adds a `paperclipResultRetention` receipt that
+names the original byte count/fingerprint and the authenticated run-log custody
+record. If non-stream metadata still exceeds the limit, priority recovery and
+timeout fields are retained first and the receipt lists omitted top-level keys.
+
+This is intentionally a forward-write compatibility change with no schema
+migration and no automatic historical rewrite. Existing oversized rows remain
+readable through the legacy safe projection. Rewriting old TOAST values can
+temporarily increase heap, TOAST, and WAL usage, so any historical compaction
+must be a separately authorized, keyset-paginated maintenance action with a
+measured free-space reserve and rollback snapshot.
+
 ## Plugin database namespaces
 
 The plugin runtime tracks plugin-owned database namespaces and migrations in `plugin_database_namespaces` and `plugin_migrations`. Hosted deployments that separate runtime and migration connections should set `DATABASE_MIGRATION_URL`; plugin namespace migration work uses the migration connection when present.

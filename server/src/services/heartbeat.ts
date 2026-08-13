@@ -94,10 +94,12 @@ import { secretService, type MissingRuntimeBinding } from "./secrets.js";
 import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
   buildHeartbeatRunIssueComment,
+  boundHeartbeatRunResultJsonForStorage,
   HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS,
   HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS,
   HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
   mergeHeartbeatRunResultJson,
+  planHeartbeatRunResultRetention,
 } from "./heartbeat-run-summary.js";
 import {
   buildHeartbeatRunStopMetadata,
@@ -14057,16 +14059,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ? (adapterResult.errorCode ?? recordedResponsibleUserDenialCode ?? "adapter_failed")
               : null;
 
-      let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
-      if (handle) {
-        logSummary = await runLogStore.finalize(handle);
-      }
-      const finalLogBytes = logSummary?.bytes;
-      if (outputProgressState.pending && typeof finalLogBytes === "number") {
-        outputProgressState.pending.bytes = finalLogBytes;
-      }
-      await flushOutputProgress({ force: true });
-
       const status =
         outcome === "succeeded"
           ? "succeeded"
@@ -14123,7 +14115,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         errorMessage: runErrorMessage,
         resultJson: adapterResult.resultJson ?? null,
       });
-      const persistedResultJson = mergeHeartbeatRunResultJson(
+      const fullPersistedResultJson = mergeHeartbeatRunResultJson(
         mergeRunStopMetadataForAgent(agent, outcome, {
           resultJson: mergeModelProfileRunMetadata(
             mergeAdapterRecoveryMetadata({
@@ -14142,6 +14134,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }),
         adapterResult.summary ?? null,
       );
+
+      const resultRetentionPlan = planHeartbeatRunResultRetention(fullPersistedResultJson);
+      if (resultRetentionPlan && !handle) {
+        throw new Error("Oversized heartbeat result has no durable run-log custody handle");
+      }
+
+      let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
+      if (handle) {
+        logSummary = await runLogStore.finalize(handle);
+      }
+      const finalLogBytes = logSummary?.bytes;
+      if (outputProgressState.pending && typeof finalLogBytes === "number") {
+        outputProgressState.pending.bytes = finalLogBytes;
+      }
+      await flushOutputProgress({ force: true });
+
+      const persistedResultJson = resultRetentionPlan
+        ? boundHeartbeatRunResultJsonForStorage({
+            resultJson: fullPersistedResultJson ?? {},
+            plan: resultRetentionPlan,
+            receipt: {
+              store: handle?.store ?? "unavailable",
+              ref: handle?.logRef ?? "unavailable",
+              bytes: logSummary?.bytes ?? null,
+              sha256: logSummary?.sha256 ?? null,
+              compressed: logSummary?.compressed ?? false,
+            },
+          })
+        : fullPersistedResultJson;
 
       const persistedRunWrite = await setRunStatusIfRunning(run.id, status, {
         finishedAt: new Date(),

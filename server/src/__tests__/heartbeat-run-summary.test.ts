@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  boundHeartbeatRunResultJsonForStorage,
   summarizeHeartbeatRunResultJson,
   buildHeartbeatRunIssueComment,
+  HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
   mergeHeartbeatRunResultJson,
+  planHeartbeatRunResultRetention,
 } from "../services/heartbeat-run-summary.js";
 
 describe("summarizeHeartbeatRunResultJson", () => {
@@ -94,5 +97,90 @@ describe("mergeHeartbeatRunResultJson", () => {
       summary: "adapter result",
       stdout: "raw stdout",
     });
+  });
+});
+
+describe("boundHeartbeatRunResultJsonForStorage", () => {
+  const receipt = {
+    store: "local_file",
+    ref: "company/agent/run.ndjson",
+    bytes: 2_000_000,
+    sha256: "a".repeat(64),
+    compressed: false,
+  };
+
+  it("leaves small result payloads on the compatibility path", () => {
+    expect(planHeartbeatRunResultRetention({ summary: "done", structured: { ok: true } })).toBeNull();
+  });
+
+  it("removes duplicated streams while preserving operational metadata and log custody", () => {
+    const resultJson = {
+      stdout: "stdout-line\n".repeat(20_000),
+      stderr: "stderr-line\n".repeat(10_000),
+      summary: "completed",
+      errorFamily: "provider_quota",
+      providerExhausted: true,
+      retryNotBefore: "2026-08-14T00:00:00.000Z",
+      configFreshness: { version: 1, session: { reset: false } },
+    };
+    const plan = planHeartbeatRunResultRetention(resultJson);
+    expect(plan).not.toBeNull();
+
+    const bounded = boundHeartbeatRunResultJsonForStorage({ resultJson, plan: plan!, receipt });
+    const marker = bounded.paperclipResultRetention as Record<string, unknown>;
+
+    expect(bounded).toMatchObject({
+      summary: "completed",
+      errorFamily: "provider_quota",
+      providerExhausted: true,
+      retryNotBefore: "2026-08-14T00:00:00.000Z",
+      configFreshness: { version: 1, session: { reset: false } },
+    });
+    expect(bounded).not.toHaveProperty("stdout");
+    expect(bounded).not.toHaveProperty("stderr");
+    expect(marker).toMatchObject({
+      version: "heartbeat_result_retention.v1",
+      truncated: true,
+      reason: "oversized_result_json",
+      omittedFields: ["stdout", "stderr"],
+      omittedFieldCount: 2,
+      custody: {
+        kind: "heartbeat_run_log",
+        store: "local_file",
+        ref: "company/agent/run.ndjson",
+        bytes: 2_000_000,
+        sha256: "a".repeat(64),
+        compressed: false,
+        apiPath: "log",
+      },
+    });
+    expect(marker.originalBytes).toBe(plan?.originalBytes);
+    expect(marker.originalSha256).toBe(plan?.originalSha256);
+    expect(Buffer.byteLength(JSON.stringify(bounded), "utf8")).toBeLessThanOrEqual(
+      HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
+    );
+  });
+
+  it("falls back to priority metadata when non-stream fields exceed the byte budget", () => {
+    const resultJson = {
+      stdout: "x".repeat(80_000),
+      summary: "s".repeat(80_000),
+      stopReason: "completed",
+      timeoutConfigured: false,
+      nestedHuge: { payload: "n".repeat(120_000) },
+      smallStructured: { kept: true },
+    };
+    const plan = planHeartbeatRunResultRetention(resultJson)!;
+    const bounded = boundHeartbeatRunResultJsonForStorage({ resultJson, plan, receipt });
+    const marker = bounded.paperclipResultRetention as Record<string, unknown>;
+
+    expect(bounded.summary).toBe("s".repeat(500));
+    expect(bounded.stopReason).toBe("completed");
+    expect(bounded.timeoutConfigured).toBe(false);
+    expect(bounded).not.toHaveProperty("nestedHuge");
+    expect(marker.omittedFields).toEqual(expect.arrayContaining(["stdout", "nestedHuge"]));
+    expect(Buffer.byteLength(JSON.stringify(bounded), "utf8")).toBeLessThanOrEqual(
+      HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
+    );
   });
 });
