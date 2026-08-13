@@ -193,6 +193,9 @@ preserves operational fields, and adds a `paperclipResultRetention` receipt that
 names the original byte count/fingerprint and the authenticated run-log custody
 record. If non-stream metadata still exceeds the limit, priority recovery and
 timeout fields are retained first and the receipt lists omitted top-level keys.
+Omitted key names longer than 256 UTF-8 bytes are represented as
+`sha256:<digest>` identifiers, so adapter-controlled key length cannot make the
+receipt exceed the persistence ceiling or turn a successful run into a failure.
 
 This is intentionally a forward-write compatibility change with no schema
 migration and no automatic historical rewrite. Existing oversized rows remain

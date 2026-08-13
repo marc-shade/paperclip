@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,12 +10,15 @@ import {
   createDb,
   environmentLeases,
   environments,
+  heartbeatRuns,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
+import { HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES } from "../services/heartbeat-run-summary.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -213,5 +216,80 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
       apiKeyPresent: true,
     });
     expect(captured.apiUrl).toEqual(expect.stringMatching(/^https?:\/\//));
+  });
+
+  it("keeps a successful run successful when result json has an oversized top-level key", async () => {
+    const adapterType = `oversized_result_key_${randomUUID()}`;
+    const oversizedKey = "K".repeat(70_000);
+    registerServerAdapter({
+      type: adapterType,
+      execute: async () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        resultJson: {
+          stdout: "x".repeat(70_000),
+          [oversizedKey]: 1,
+        },
+      }),
+      testEnvironment: async () => ({
+        adapterType,
+        status: "pass",
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    });
+
+    try {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "OversizedResultAgent",
+        role: "engineer",
+        status: "idle",
+        adapterType,
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      const heartbeat = heartbeatService(db);
+      const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+      expect(queued).not.toBeNull();
+
+      const finished = await waitForRunToFinish(heartbeat, queued!.id);
+      expect(finished?.status).toBe("succeeded");
+
+      const [stored] = await db
+        .select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, queued!.id));
+      expect(stored?.status).toBe("succeeded");
+      expect(Buffer.byteLength(JSON.stringify(stored?.resultJson), "utf8")).toBeLessThanOrEqual(
+        HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
+      );
+      const retention = (stored?.resultJson as Record<string, unknown>)
+        .paperclipResultRetention as Record<string, unknown>;
+      expect(retention.omittedFields).toEqual([
+        "stdout",
+        `sha256:${createHash("sha256").update(oversizedKey).digest("hex")}`,
+      ]);
+      // Final status is persisted before best-effort lifecycle bookkeeping.
+      // Let that continuation drain before fixture cleanup truncates its rows.
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    } finally {
+      unregisterServerAdapter(adapterType);
+    }
   });
 });

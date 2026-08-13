@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   boundHeartbeatRunResultJsonForStorage,
@@ -179,6 +180,25 @@ describe("boundHeartbeatRunResultJsonForStorage", () => {
     expect(bounded.timeoutConfigured).toBe(false);
     expect(bounded).not.toHaveProperty("nestedHuge");
     expect(marker.omittedFields).toEqual(expect.arrayContaining(["stdout", "nestedHuge"]));
+    expect(Buffer.byteLength(JSON.stringify(bounded), "utf8")).toBeLessThanOrEqual(
+      HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
+    );
+  });
+
+  it("content-addresses oversized field names so the retention receipt always fits", () => {
+    const oversizedKey = "K".repeat(70_000);
+    const resultJson = {
+      stdout: "x".repeat(70_000),
+      [oversizedKey]: 1,
+    };
+    const plan = planHeartbeatRunResultRetention(resultJson)!;
+
+    const bounded = boundHeartbeatRunResultJsonForStorage({ resultJson, plan, receipt });
+    const marker = bounded.paperclipResultRetention as Record<string, unknown>;
+    const expectedIdentifier = `sha256:${createHash("sha256").update(oversizedKey).digest("hex")}`;
+
+    expect(marker.omittedFields).toEqual(["stdout", expectedIdentifier]);
+    expect(JSON.stringify(bounded)).not.toContain(oversizedKey);
     expect(Buffer.byteLength(JSON.stringify(bounded), "utf8")).toBeLessThanOrEqual(
       HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
     );

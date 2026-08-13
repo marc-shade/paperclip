@@ -39,6 +39,7 @@ const HEARTBEAT_RUN_RESULT_PRIORITY_TEXT_FIELDS = new Set([
   "errorMessage",
 ]);
 const HEARTBEAT_RUN_RESULT_MAX_RETAINED_TOP_LEVEL_FIELDS = 500;
+const HEARTBEAT_RUN_RESULT_MAX_OMITTED_FIELD_NAME_BYTES = 256;
 
 export interface HeartbeatRunResultLogReceipt {
   store: string;
@@ -85,7 +86,7 @@ export function planHeartbeatRunResultRetention(
 function retentionMarker(input: {
   plan: HeartbeatRunResultRetentionPlan;
   receipt: HeartbeatRunResultLogReceipt;
-  omittedFields: string[];
+  omittedFieldIdentifiers: string[];
   omittedFieldCount: number;
 }) {
   return {
@@ -95,7 +96,7 @@ function retentionMarker(input: {
     originalBytes: input.plan.originalBytes,
     originalSha256: input.plan.originalSha256,
     streamBytes: input.plan.streamBytes,
-    omittedFields: input.omittedFields.slice(0, 100),
+    omittedFields: input.omittedFieldIdentifiers.slice(0, 100),
     omittedFieldCount: input.omittedFieldCount,
     custody: {
       kind: "heartbeat_run_log",
@@ -107,6 +108,13 @@ function retentionMarker(input: {
       apiPath: "log",
     },
   };
+}
+
+function contentAddressOversizedFieldName(field: string) {
+  if (Buffer.byteLength(field, "utf8") <= HEARTBEAT_RUN_RESULT_MAX_OMITTED_FIELD_NAME_BYTES) {
+    return field;
+  }
+  return `sha256:${createHash("sha256").update(field).digest("hex")}`;
 }
 
 function fitsResultJsonLimit(value: Record<string, unknown>) {
@@ -139,7 +147,7 @@ export function boundHeartbeatRunResultJsonForStorage(input: {
   const streamOnlyMarker = retentionMarker({
     plan: input.plan,
     receipt: input.receipt,
-    omittedFields: omittedStreams,
+    omittedFieldIdentifiers: omittedStreams,
     omittedFieldCount: omittedStreams.length,
   });
   const streamCompacted = {
@@ -152,7 +160,13 @@ export function boundHeartbeatRunResultJsonForStorage(input: {
   const retainedKeys = new Set<string>();
   const sourceEntries = Object.entries(withoutStreams);
   const sourceKeys = sourceEntries.map(([key]) => key);
-  const worstCaseOmittedFields = [...omittedStreams, ...sourceKeys];
+  const sourceFieldIdentifiers = new Map(
+    sourceKeys.map((key) => [key, contentAddressOversizedFieldName(key)]),
+  );
+  const worstCaseOmittedFieldIdentifiers = [
+    ...omittedStreams,
+    ...sourceKeys.map((key) => sourceFieldIdentifiers.get(key)!),
+  ];
 
   const tryRetain = (key: string, value: unknown) => {
     if (retainedKeys.has(key)) return;
@@ -162,8 +176,8 @@ export function boundHeartbeatRunResultJsonForStorage(input: {
       [HEARTBEAT_RUN_RESULT_RETENTION_FIELD]: retentionMarker({
         plan: input.plan,
         receipt: input.receipt,
-        omittedFields: worstCaseOmittedFields,
-        omittedFieldCount: worstCaseOmittedFields.length,
+        omittedFieldIdentifiers: worstCaseOmittedFieldIdentifiers,
+        omittedFieldCount: worstCaseOmittedFieldIdentifiers.length,
       }),
     };
     if (!fitsResultJsonLimit(candidate)) return;
@@ -185,17 +199,19 @@ export function boundHeartbeatRunResultJsonForStorage(input: {
     tryRetain(key, value);
   }
 
-  const omittedFields = [
+  const omittedFieldIdentifiers = [
     ...omittedStreams,
-    ...sourceKeys.filter((key) => !retainedKeys.has(key)),
+    ...sourceKeys
+      .filter((key) => !retainedKeys.has(key))
+      .map((key) => sourceFieldIdentifiers.get(key)!),
   ];
   const bounded = {
     ...retained,
     [HEARTBEAT_RUN_RESULT_RETENTION_FIELD]: retentionMarker({
       plan: input.plan,
       receipt: input.receipt,
-      omittedFields,
-      omittedFieldCount: omittedFields.length,
+      omittedFieldIdentifiers,
+      omittedFieldCount: omittedFieldIdentifiers.length,
     }),
   };
 

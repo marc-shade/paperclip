@@ -42,6 +42,11 @@ the object unchanged. For an oversized object:
 4. Persist a marker containing policy version, original byte count and SHA-256,
    stdout/stderr byte counts, omitted keys, and the run-log store/ref/bytes/hash.
 
+Omitted field identifiers are themselves bounded: names at most 256 UTF-8 bytes
+remain readable verbatim, while longer names become `sha256:<digest>`. This
+keeps the receipt size independent of adapter-controlled key length while still
+providing a content-addressed identity for every listed key.
+
 The marker is explicit; callers never mistake a compacted object for a complete
 legacy result.
 
@@ -118,6 +123,12 @@ legacy oversized-value projection.
 Another misfire is claiming custody from `log_ref` alone. The rollout proof must
 require a readable ref and matching `log_sha256`; a missing or unhashed log is
 not an auditable receipt.
+
+A third misfire is bounding values but copying arbitrary adapter key names into
+the receipt. A key over 65,536 bytes previously made compaction throw during
+finalization and converted an otherwise successful run into a failed run. The
+regression suite now executes that shape through the heartbeat service, asserts
+the run remains `succeeded`, and inspects the raw stored JSON byte count.
 
 ## Blind spots considered
 
