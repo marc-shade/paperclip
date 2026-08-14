@@ -9,6 +9,19 @@ import {
   planHeartbeatRunResultRetention,
 } from "../services/heartbeat-run-summary.js";
 
+const OMITTED_FIELD_HASH_DOMAIN = "paperclip:heartbeat-omitted-field-key:utf16be:v1\0";
+
+function independentlyContentAddressFieldName(field: string) {
+  const codeUnits = Buffer.alloc(field.length * 2);
+  for (let index = 0; index < field.length; index += 1) {
+    codeUnits.writeUInt16BE(field.charCodeAt(index), index * 2);
+  }
+  return `sha256:${createHash("sha256")
+    .update(OMITTED_FIELD_HASH_DOMAIN, "utf8")
+    .update(codeUnits)
+    .digest("hex")}`;
+}
+
 describe("summarizeHeartbeatRunResultJson", () => {
   it("truncates text fields and preserves cost aliases", () => {
     const summary = summarizeHeartbeatRunResultJson({
@@ -195,7 +208,7 @@ describe("boundHeartbeatRunResultJsonForStorage", () => {
 
     const bounded = boundHeartbeatRunResultJsonForStorage({ resultJson, plan, receipt });
     const marker = bounded.paperclipResultRetention as Record<string, unknown>;
-    const expectedIdentifier = `sha256:${createHash("sha256").update(oversizedKey).digest("hex")}`;
+    const expectedIdentifier = independentlyContentAddressFieldName(oversizedKey);
 
     expect(marker.omittedFields).toEqual(["stdout", expectedIdentifier]);
     expect(JSON.stringify(bounded)).not.toContain(oversizedKey);
@@ -216,12 +229,11 @@ describe("boundHeartbeatRunResultJsonForStorage", () => {
     expect(Buffer.byteLength(escapedKeys[0]!, "utf8")).toBe(253);
     expect(Buffer.byteLength(JSON.stringify(escapedKeys[0]), "utf8")).toBe(1_505);
     const plan = planHeartbeatRunResultRetention(resultJson)!;
+    expect(plan.originalBytes).toBe(220_813);
 
     const bounded = boundHeartbeatRunResultJsonForStorage({ resultJson, plan, receipt });
     const marker = bounded.paperclipResultRetention as Record<string, unknown>;
-    const expectedIdentifiers = escapedKeys.map(
-      (key) => `sha256:${createHash("sha256").update(key).digest("hex")}`,
-    );
+    const expectedIdentifiers = escapedKeys.map(independentlyContentAddressFieldName);
 
     expect(marker.omittedFields).toEqual(["stdout", ...expectedIdentifiers]);
     expect(marker.omittedFieldCount).toBe(101);
@@ -229,13 +241,11 @@ describe("boundHeartbeatRunResultJsonForStorage", () => {
     expect(marker.originalSha256).toBe(
       createHash("sha256").update(JSON.stringify(resultJson)).digest("hex"),
     );
-    expect(Buffer.byteLength(JSON.stringify(bounded), "utf8")).toBeLessThanOrEqual(
-      HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
-    );
+    expect(Buffer.byteLength(JSON.stringify(bounded), "utf8")).toBe(7_942);
   });
 
-  it("content-addresses short JSON keys that PostgreSQL jsonb cannot represent", () => {
-    const unsafeKeys = ["nul\0key", "lone-high-\ud800", "lone-low-\udc00"];
+  it("content-addresses every JavaScript key injectively before hashing", () => {
+    const unsafeKeys = ["lone-high-\ud800", "lone-high-\ud801", "lone-low-\udc00"];
     const resultJson = Object.fromEntries([
       ["stdout", "x".repeat(70_000)],
       ...unsafeKeys.map((key) => [key, 1] as const),
@@ -244,11 +254,13 @@ describe("boundHeartbeatRunResultJsonForStorage", () => {
 
     const bounded = boundHeartbeatRunResultJsonForStorage({ resultJson, plan, receipt });
     const marker = bounded.paperclipResultRetention as Record<string, unknown>;
-    const expectedIdentifiers = unsafeKeys.map(
-      (key) => `sha256:${createHash("sha256").update(key).digest("hex")}`,
-    );
+    const expectedIdentifiers = unsafeKeys.map(independentlyContentAddressFieldName);
 
     expect(marker.omittedFields).toEqual(["stdout", ...expectedIdentifiers]);
+    expect(new Set(expectedIdentifiers).size).toBe(unsafeKeys.length);
+    expect(createHash("sha256").update(unsafeKeys[0]!).digest("hex")).toBe(
+      createHash("sha256").update(unsafeKeys[1]!).digest("hex"),
+    );
     expect(unsafeKeys.every((key) => !(key in bounded))).toBe(true);
     expect(Buffer.byteLength(JSON.stringify(bounded), "utf8")).toBeLessThanOrEqual(
       HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,

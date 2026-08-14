@@ -20,6 +20,19 @@ import { heartbeatService } from "../services/heartbeat.ts";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
 import { HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES } from "../services/heartbeat-run-summary.ts";
 
+const OMITTED_FIELD_HASH_DOMAIN = "paperclip:heartbeat-omitted-field-key:utf16be:v1\0";
+
+function independentlyContentAddressFieldName(field: string) {
+  const codeUnits = Buffer.alloc(field.length * 2);
+  for (let index = 0; index < field.length; index += 1) {
+    codeUnits.writeUInt16BE(field.charCodeAt(index), index * 2);
+  }
+  return `sha256:${createHash("sha256")
+    .update(OMITTED_FIELD_HASH_DOMAIN, "utf8")
+    .update(codeUnits)
+    .digest("hex")}`;
+}
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -283,7 +296,7 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
         .paperclipResultRetention as Record<string, unknown>;
       expect(retention.omittedFields).toEqual([
         "stdout",
-        `sha256:${createHash("sha256").update(oversizedKey).digest("hex")}`,
+        independentlyContentAddressFieldName(oversizedKey),
       ]);
       // Final status is persisted before best-effort lifecycle bookkeeping.
       // Let that continuation drain before fixture cleanup truncates its rows.
@@ -365,15 +378,93 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
 
       const storedResultJson = stored?.resultJson as Record<string, unknown>;
       const retention = storedResultJson.paperclipResultRetention as Record<string, unknown>;
-      const expectedIdentifiers = escapedKeys.map(
-        (key) => `sha256:${createHash("sha256").update(key).digest("hex")}`,
-      );
+      const expectedIdentifiers = escapedKeys.map(independentlyContentAddressFieldName);
       expect(retention.omittedFields).toEqual(["stdout", ...expectedIdentifiers]);
       expect(retention.omittedFieldCount).toBe(101);
       expect(escapedKeys.every((key) => !(key in storedResultJson))).toBe(true);
       // The heartbeat service adds stop/config metadata before fingerprinting;
       // the direct regression above binds the exact adapter-payload digest.
       expect(retention.originalSha256).toEqual(expect.stringMatching(/^[a-f0-9]{64}$/));
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    } finally {
+      unregisterServerAdapter(adapterType);
+    }
+  });
+
+  it("persists distinct custody for lone-surrogate omitted field names", async () => {
+    const adapterType = `surrogate_result_keys_${randomUUID()}`;
+    const unsafeKeys = ["lone-high-\ud800", "lone-high-\ud801", "lone-low-\udc00"];
+    const resultJson = Object.fromEntries([
+      ["stdout", "x".repeat(70_000)],
+      ...unsafeKeys.map((key) => [key, 1] as const),
+    ]);
+    registerServerAdapter({
+      type: adapterType,
+      execute: async () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        resultJson,
+      }),
+      testEnvironment: async () => ({
+        adapterType,
+        status: "pass",
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    });
+
+    try {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "SurrogateResultKeysAgent",
+        role: "engineer",
+        status: "idle",
+        adapterType,
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      const heartbeat = heartbeatService(db);
+      const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+      expect(queued).not.toBeNull();
+
+      const finished = await waitForRunToFinish(heartbeat, queued!.id);
+      expect(finished?.status).toBe("succeeded");
+
+      const [stored] = await db
+        .select({
+          status: heartbeatRuns.status,
+          resultJson: heartbeatRuns.resultJson,
+          resultJsonBytes: sql<number>`octet_length(${heartbeatRuns.resultJson}::text)`,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, queued!.id));
+      expect(stored?.status).toBe("succeeded");
+      expect(Number(stored?.resultJsonBytes)).toBeLessThanOrEqual(
+        HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
+      );
+
+      const storedResultJson = stored?.resultJson as Record<string, unknown>;
+      const retention = storedResultJson.paperclipResultRetention as Record<string, unknown>;
+      const expectedIdentifiers = unsafeKeys.map(independentlyContentAddressFieldName);
+      expect(new Set(expectedIdentifiers).size).toBe(unsafeKeys.length);
+      expect(retention.omittedFields).toEqual(["stdout", ...expectedIdentifiers]);
+      expect(retention.omittedFieldCount).toBe(4);
+      expect(unsafeKeys.every((key) => !(key in storedResultJson))).toBe(true);
       await new Promise((resolve) => setTimeout(resolve, 250));
     } finally {
       unregisterServerAdapter(adapterType);

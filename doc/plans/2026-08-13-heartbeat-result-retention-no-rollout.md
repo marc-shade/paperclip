@@ -15,6 +15,38 @@ without discarding audit custody. The existing run log remains the authoritative
 stdout/stderr record and is already exposed through the authenticated heartbeat
 run-log API with a relative ref, byte count, and SHA-256.
 
+## ARC-5724 injective omitted-key custody repair
+
+Feynman's ARC-5680 re-audit found that ARC-5678 passed an unsafe JavaScript
+property-key string directly to Node's SHA-256 update path. Node encodes lone
+UTF-16 surrogates as the replacement character U+FFFD, so distinct keys ending
+in U+D800 and U+D801 received the same identifier. ARC-5724 replaces that lossy
+preimage conversion with an explicitly versioned, domain-separated encoding:
+
+1. UTF-8 bytes of
+   `paperclip:heartbeat-omitted-field-key:utf16be:v1` followed by NUL;
+2. every property-name UTF-16 code unit, including lone surrogates, encoded as
+   one unsigned big-endian 16-bit value;
+3. SHA-256 over the concatenation, formatted as `sha256:<lowercase hex>`.
+
+The fixed-width code-unit suffix is injective for all JavaScript strings. The
+direct regression independently rebuilds the encoding and proves keys ending in
+lone U+D800, U+D801, and U+DC00 produce three distinct identifiers, while also
+reproducing the rejected UTF-8 collision for U+D800/U+D801. The selected
+embedded-Postgres regression independently rebuilds the same three identifiers,
+persists terminal status `succeeded`, and queries raw
+`octet_length(result_json::text) <= 65,536`.
+
+The exact 100-NUL-key fixture is unchanged and is now executable-test-bound at
+220,813 bytes before compaction and 7,942 bytes after compaction. Focused unit
+verification passes 14/14. The selected embedded-Postgres verification passes
+2/2 with 3 unrelated tests skipped. `pnpm --filter @paperclipai/server typecheck`
+passes. `/Users/marc/ARC-AGI-3/.venv/bin/python
+scripts/integration_audit.py --strict` passes with `ORPHAN=0` (`REAL=2`,
+`RESEARCH-PENDING=1`, `FALSIFIED=16`, `NON-CANDIDATE=82`). No production
+rollout, restart, backfill, database mutation, TOAST reclaim, log truncation,
+or service action is authorized by this repair.
+
 ## ARC-5678 corrective delta
 
 The ARC-5676 re-audit found that the first correction measured omitted names by
@@ -25,7 +57,7 @@ that exceed 256 serialized bytes, and never copies content-addressed names back
 as PostgreSQL `jsonb` keys. NUL-bearing and unpaired-surrogate names are always
 content-addressed because PostgreSQL cannot represent them as `jsonb` strings.
 
-The exact direct reproducer is 220,813 bytes before compaction and 7,941 bytes
+The exact direct reproducer is 220,813 bytes before compaction and 7,942 bytes
 after compaction. Its 100 adapter keys are each 253 raw UTF-8 bytes / 1,505 JSON
 bytes; the receipt contains `stdout` plus all 100 exact `sha256:<digest>`
 identifiers (`omittedFieldCount=101`).
@@ -77,6 +109,8 @@ a larger serialized cost become `sha256:<digest>`. The serialized check is
 load-bearing because short raw names can expand sixfold through JSON escaping.
 Names containing NUL or unpaired UTF-16 surrogates are content-addressed at any
 length because PostgreSQL `jsonb` rejects those otherwise JSON-serializable keys.
+The digest preimage is the ARC-5724 domain/version prefix plus the exact UTF-16BE
+code-unit sequence, preserving every JavaScript property-key string injectively.
 Known stream names are listed separately from up to 100 adapter-controlled names,
 and content-addressed names are never copied back as JSONB keys. The 100-key
 regression therefore retains the exact content address of every omitted key.

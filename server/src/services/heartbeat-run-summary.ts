@@ -41,6 +41,8 @@ const HEARTBEAT_RUN_RESULT_PRIORITY_TEXT_FIELDS = new Set([
 const HEARTBEAT_RUN_RESULT_MAX_RETAINED_TOP_LEVEL_FIELDS = 500;
 const HEARTBEAT_RUN_RESULT_MAX_LISTED_OMITTED_TOP_LEVEL_FIELDS = 100;
 const HEARTBEAT_RUN_RESULT_MAX_OMITTED_FIELD_IDENTIFIER_JSON_BYTES = 256;
+const HEARTBEAT_RUN_RESULT_OMITTED_FIELD_HASH_DOMAIN =
+  "paperclip:heartbeat-omitted-field-key:utf16be:v1\0";
 
 export interface HeartbeatRunResultLogReceipt {
   store: string;
@@ -140,7 +142,19 @@ function contentAddressUnsafeOrOversizedFieldName(field: string) {
   ) {
     return field;
   }
-  return `sha256:${createHash("sha256").update(field).digest("hex")}`;
+  // Node's default string-to-UTF-8 conversion replaces every lone UTF-16
+  // surrogate with U+FFFD. Hash the original code-unit sequence instead so
+  // every JavaScript property-key string has one independently reproducible,
+  // injective preimage encoding before SHA-256.
+  const codeUnits = Buffer.allocUnsafe(field.length * 2);
+  for (let index = 0; index < field.length; index += 1) {
+    codeUnits.writeUInt16BE(field.charCodeAt(index), index * 2);
+  }
+  const digest = createHash("sha256")
+    .update(HEARTBEAT_RUN_RESULT_OMITTED_FIELD_HASH_DOMAIN, "utf8")
+    .update(codeUnits)
+    .digest("hex");
+  return `sha256:${digest}`;
 }
 
 function fitsResultJsonLimit(value: Record<string, unknown>) {

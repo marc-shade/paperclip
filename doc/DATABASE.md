@@ -195,10 +195,15 @@ record. If non-stream metadata still exceeds the limit, priority recovery and
 timeout fields are retained first and the receipt lists omitted top-level keys.
 Receipt identifiers are bounded by their serialized JSON byte cost, so names
 whose JSON string encoding exceeds 256 UTF-8 bytes are represented as
-`sha256:<digest>` identifiers. Names containing NUL or unpaired UTF-16
-surrogates are also content-addressed because PostgreSQL `jsonb` cannot represent
-them. Adapter-controlled key shape or length therefore cannot make the receipt
-exceed the persistence ceiling or turn a successful run into a failure.
+`sha256:<digest>` identifiers. The digest input is the domain string
+`paperclip:heartbeat-omitted-field-key:utf16be:v1` followed by NUL and the
+property name's exact UTF-16 code units in big-endian order. This encoding is
+injective for every JavaScript string; unlike Node's default UTF-8 conversion,
+it does not replace distinct lone surrogates with the same U+FFFD bytes. Names
+containing NUL or unpaired UTF-16 surrogates are always content-addressed because
+PostgreSQL `jsonb` cannot represent them. Adapter-controlled key shape or length
+therefore cannot make the receipt exceed the persistence ceiling or turn a
+successful run into a failure.
 
 This is intentionally a forward-write compatibility change with no schema
 migration and no automatic historical rewrite. Existing oversized rows remain
