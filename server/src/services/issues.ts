@@ -713,6 +713,15 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
 }
 
 export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
+// A `scheduled_retry` run is not terminal (it can still fire later), but it holds no active
+// execution right now and can sit dormant for days (retry backoff parks it at the provider's
+// own quota-reset time — see ARC-5774). When the SAME issue's checkout/execution lock points at
+// one, it should not block a fresh live run from the same assignee (or an unassigned issue) from
+// reclaiming the lock via checkout/assertCheckoutOwner/release. This set is deliberately scoped
+// to those issue-lock reclaim checks only — recovery/service.ts keeps using
+// TERMINAL_HEARTBEAT_RUN_STATUSES unmodified for its own run-completion semantics, since a
+// scheduled_retry run is still "pending", not "done".
+const LOCK_RECLAIMABLE_HEARTBEAT_RUN_STATUSES = new Set([...TERMINAL_HEARTBEAT_RUN_STATUSES, "scheduled_retry"]);
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
@@ -4462,7 +4471,7 @@ export function issueService(db: Db) {
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     if (!run) return true;
-    return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+    return LOCK_RECLAIMABLE_HEARTBEAT_RUN_STATUSES.has(run.status);
   }
 
   async function adoptStaleCheckoutRun(input: {
@@ -4516,7 +4525,7 @@ export function issueService(db: Db) {
           .where(eq(heartbeatRuns.id, input.actorRunId))
           .then((rows) => rows[0] ?? null),
       ]);
-      const stale = !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status);
+      const stale = !existingRun || LOCK_RECLAIMABLE_HEARTBEAT_RUN_STATUSES.has(existingRun.status);
       const actorLive = actorRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status);
       if (!stale || !actorLive) {
         return { adopted: null, latest: lockedIssue };
@@ -4633,7 +4642,7 @@ export function issueService(db: Db) {
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, issue.executionRunId))
         .then((rows) => rows[0] ?? null);
-      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+      if (run && !LOCK_RECLAIMABLE_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
 
       const updated = await tx
         .update(issues)
@@ -4658,9 +4667,10 @@ export function issueService(db: Db) {
 
   // Symmetric to clearExecutionRunIfTerminal. Clears checkoutRunId (and the
   // bundled execution lock cols) when the row's checkoutRunId points at a
-  // heartbeat run that is terminal or no longer exists. No assignee/status
-  // precondition: a terminal run holds no real claim regardless of who is
-  // assigned or what status the issue is currently in.
+  // heartbeat run that is terminal, dormant in scheduled_retry, or no longer
+  // exists. No assignee/status precondition: a run in one of those states
+  // holds no real claim regardless of who is assigned or what status the
+  // issue is currently in.
   async function clearCheckoutRunIfTerminal(issueId: string): Promise<boolean> {
     return db.transaction(async (tx) => {
       await tx.execute(
@@ -4681,7 +4691,7 @@ export function issueService(db: Db) {
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, issue.checkoutRunId))
         .then((rows) => rows[0] ?? null);
-      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+      if (run && !LOCK_RECLAIMABLE_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
 
       if (issue.executionRunId && issue.executionRunId !== issue.checkoutRunId) {
         await tx.execute(
@@ -4692,7 +4702,7 @@ export function issueService(db: Db) {
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, issue.executionRunId))
           .then((rows) => rows[0] ?? null);
-        if (executionRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(executionRun.status)) return false;
+        if (executionRun && !LOCK_RECLAIMABLE_HEARTBEAT_RUN_STATUSES.has(executionRun.status)) return false;
       }
 
       const updated = await tx
