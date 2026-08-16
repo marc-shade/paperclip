@@ -7986,6 +7986,12 @@ export function issueRoutes(
 
     let issue;
     try {
+      // ARC-5774: Reclaim stale execution locks before attempting update.
+      // This allows a fresh run to recover from a dormant scheduled_retry lock
+      // without triggering a conflict error.
+      await svc.clearExecutionRunIfTerminal(id);
+      await svc.clearCheckoutRunIfTerminal(id);
+
       if (transition.decision && decisionId) {
         const decision = transition.decision;
         issue = await db.transaction(async (tx) => {
