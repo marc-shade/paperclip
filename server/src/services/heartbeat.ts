@@ -15890,24 +15890,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         const cancelStaleScheduledRetry = async (scheduledRun: typeof heartbeatRuns.$inferSelect) => {
           const issueCancelled = issue.status === "cancelled";
+          const monitorDueSupersedesRetry = reason === "issue_monitor_due" && scheduledRun.status === "scheduled_retry";
           if (
             scheduledRun.status !== "scheduled_retry" ||
-            (scheduledRun.agentId === issue.assigneeAgentId && !issueCancelled)
+            (scheduledRun.agentId === issue.assigneeAgentId && !issueCancelled && !monitorDueSupersedesRetry)
           ) {
             return false;
           }
 
           const now = new Date();
-          const reason = issueCancelled
-            ? "Cancelled because the issue was cancelled before the scheduled retry became due"
-            : "Cancelled because the issue was reassigned before the scheduled retry became due";
+          const cancelReason = monitorDueSupersedesRetry
+            ? "Cancelled because a due issue monitor queued a fresh owner wake before the scheduled retry became due"
+            : issueCancelled
+              ? "Cancelled because the issue was cancelled before the scheduled retry became due"
+              : "Cancelled because the issue was reassigned before the scheduled retry became due";
           const cancelled = await tx
             .update(heartbeatRuns)
             .set({
               status: "cancelled",
               finishedAt: now,
-              error: reason,
-              errorCode: issueCancelled ? "issue_cancelled" : "issue_reassigned",
+              error: cancelReason,
+              errorCode: monitorDueSupersedesRetry
+                ? "issue_monitor_superseded_retry"
+                : issueCancelled
+                  ? "issue_cancelled"
+                  : "issue_reassigned",
               updatedAt: now,
             })
             .where(and(eq(heartbeatRuns.id, scheduledRun.id), eq(heartbeatRuns.status, "scheduled_retry")))
@@ -15922,7 +15929,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .set({
                 status: "cancelled",
                 finishedAt: now,
-                error: reason,
+                error: cancelReason,
                 updatedAt: now,
               })
               .where(eq(agentWakeupRequests.id, scheduledRun.wakeupRequestId));
@@ -15953,9 +15960,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             eventType: "lifecycle",
             stream: "system",
             level: "warn",
-            message: issueCancelled
-              ? "Scheduled retry cancelled because issue was cancelled before it became due"
-              : "Scheduled retry cancelled because issue ownership changed before it became due",
+            message: monitorDueSupersedesRetry
+              ? "Scheduled retry cancelled because a due issue monitor superseded it"
+              : issueCancelled
+                ? "Scheduled retry cancelled because issue was cancelled before it became due"
+                : "Scheduled retry cancelled because issue ownership changed before it became due",
             payload: {
               issueId: issue.id,
               issueStatus: issue.status,

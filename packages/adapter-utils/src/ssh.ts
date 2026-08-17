@@ -787,7 +787,7 @@ async function importGitWorkspaceToSsh(input: {
       maxBuffer: 16 * 1024,
     });
     await runLocalGit(input.localDir, ["bundle", "create", bundlePath, tempRef], {
-      timeout: 60_000,
+      timeout: 180_000,
       maxBuffer: 1024 * 1024,
     });
 

@@ -338,6 +338,72 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(participantRuns[0]?.errorCode).not.toBe("issue_assignee_changed");
   });
 
+  it("cancels an older scheduled retry lock when a due issue monitor queues the owner wake", async () => {
+    const { issueId, agentId, companyId } = await seedFixture();
+    const heartbeat = heartbeatService(db);
+    const scheduledRetryRunId = randomUUID();
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    await db.insert(heartbeatRuns).values({
+      id: scheduledRetryRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "retry",
+      status: "scheduled_retry",
+      scheduledRetryAt: new Date("2026-04-12T04:15:00.000Z"),
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "transient_failure",
+      contextSnapshot: {
+        issueId,
+        wakeReason: "process_lost_retry",
+      },
+    });
+    await db
+      .update(issues)
+      .set({
+        executionRunId: scheduledRetryRunId,
+        executionAgentNameKey: "monitorbot",
+        executionLockedAt: new Date("2026-04-11T12:00:00.000Z"),
+      })
+      .where(eq(issues.id, issueId));
+
+    const result = await heartbeat.tickTimers(tickAt);
+
+    expect(result.enqueued).toBe(1);
+
+    const staleRetry = await db
+      .select({
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduledRetryRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(staleRetry).toEqual({
+      status: "cancelled",
+      errorCode: "issue_monitor_superseded_retry",
+    });
+
+    const issue = await db
+      .select({
+        executionRunId: issues.executionRunId,
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]!);
+    expect(issue.executionRunId).not.toBe(scheduledRetryRunId);
+    expect(issue.monitorNextCheckAt).toBeNull();
+
+    const monitorWake = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.find((row) => row.reason === "issue_monitor_due") ?? null);
+    expect(monitorWake).not.toBeNull();
+  });
+
   it("lets the board trigger a scheduled issue monitor immediately", async () => {
     const { issueId, agentId, nextCheckAt } = await seedFixture();
     const heartbeat = heartbeatService(db);

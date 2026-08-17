@@ -6,9 +6,15 @@ export const label = "Claude Code";
 export const SANDBOX_INSTALL_COMMAND = "npm install -g @anthropic-ai/claude-code";
 
 export const models = [
+  { id: "claude-opus-5", label: "Claude Opus 5" },
   { id: "claude-opus-4-8", label: "Claude Opus 4.8" },
   { id: "claude-fable-5", label: "Claude Fable 5" },
   { id: "claude-mythos-5", label: "Claude Mythos 5" },
+  // claude-sonnet-5 was in live use by 26 agents while absent from this list.
+  // Nothing validates the model string, so those agents ran fine — but editing
+  // such an agent in the UI can silently reset it to a listed value. Keep this
+  // list a SUPERSET of what is actually deployed.
+  { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
   { id: "claude-opus-4-7", label: "Claude Opus 4.7" },
   { id: "claude-opus-4-6", label: "Claude Opus 4.6" },
   { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
