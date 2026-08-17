@@ -3064,6 +3064,22 @@ export async function runChildProcess(
     })
       .then((target) => {
         const childEnv = { ...mergedEnv, ...target.env };
+        // `spawn({ cwd })` sets the child's real OS working directory but does
+        // NOT update the `PWD` value inside the env we hand it — that PWD is
+        // still whatever the Paperclip daemon itself inherited (e.g. the
+        // directory it was launched from). Some CLIs (observed: OpenCode)
+        // trust `PWD` over `process.cwd()` to anchor project/session state,
+        // so a stale inherited PWD makes every local run silently anchor to
+        // the daemon's own cwd instead of the run's cwd. Keep PWD in sync
+        // with the actual local spawn cwd; skip this for remote/sandboxed
+        // targets, where the wrapper (ssh/bwrap) establishes the real target
+        // cwd independently and sanitizeRemoteExecutionEnv already governs
+        // identity env vars for those paths.
+        if (!opts.remoteExecution && !opts.localProcessSandbox) {
+          const spawnCwd = target.cwd ?? opts.cwd;
+          if (spawnCwd) childEnv.PWD = spawnCwd;
+          delete childEnv.OLDPWD;
+        }
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }

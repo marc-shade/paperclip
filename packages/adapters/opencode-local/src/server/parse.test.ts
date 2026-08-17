@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseOpenCodeJsonl, isOpenCodeUnknownSessionError } from "./parse.js";
+import { parseOpenCodeJsonl, isOpenCodeUnknownSessionError, isOpenCodeSessionId } from "./parse.js";
 
 describe("parseOpenCodeJsonl", () => {
   it("parses assistant text, usage, cost, and errors", () => {
@@ -73,5 +73,15 @@ describe("parseOpenCodeJsonl", () => {
     expect(isOpenCodeUnknownSessionError("Session not found: s_123", "")).toBe(true);
     expect(isOpenCodeUnknownSessionError("", "unknown session id")).toBe(true);
     expect(isOpenCodeUnknownSessionError("all good", "")).toBe(false);
+  });
+
+  it("recognizes OpenCode session ids and rejects other adapters' session ids", () => {
+    // ARC-5873 secondary fix: a stored sessionId saved by claude_local (a
+    // UUID) or codex_local must never be treated as resumable by
+    // opencode_local; today that mismatch burns a guaranteed-failed
+    // `opencode --session <id>` attempt before the retry path recovers.
+    expect(isOpenCodeSessionId("ses_ff00a072cffeQQwj1g62id5dJp")).toBe(true);
+    expect(isOpenCodeSessionId("0d65c2af-6720-4302-802f-0b9b6bcf8f69")).toBe(false);
+    expect(isOpenCodeSessionId("")).toBe(false);
   });
 });

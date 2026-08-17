@@ -390,6 +390,39 @@ describe("adapter skill snapshots", () => {
 });
 
 describe("runChildProcess", () => {
+  it("syncs the child's PWD with the spawn cwd instead of leaking the daemon's inherited PWD", async () => {
+    // ARC-5873 regression: spawn({ cwd }) changes the OS-level working
+    // directory but does not update env.PWD. If the daemon's own
+    // process.env.PWD (e.g. wherever the Paperclip daemon was launched from)
+    // leaks into the child unmodified, CLIs that trust PWD over
+    // process.cwd() to anchor project state (observed: OpenCode) silently
+    // anchor to the wrong directory. Run the child in a directory that
+    // differs from this test process's own PWD and assert the child sees a
+    // PWD matching the real spawn cwd.
+    const runDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pwd-regression-"));
+    try {
+      const realRunDir = await fs.realpath(runDir);
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        ["-e", "process.stdout.write(process.env.PWD || '')"],
+        {
+          cwd: realRunDir,
+          env: { PWD: "/some/stale/daemon/launch/dir" },
+          timeoutSec: 5,
+          graceSec: 1,
+          onLog: async () => {},
+        },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe(realRunDir);
+      expect(result.stdout).not.toBe("/some/stale/daemon/launch/dir");
+    } finally {
+      await fs.rm(runDir, { recursive: true, force: true });
+    }
+  });
+
   it("does not arm a timeout when timeoutSec is 0", async () => {
     const result = await runChildProcess(
       randomUUID(),
