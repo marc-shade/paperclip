@@ -466,7 +466,9 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
   // and reviewing the watch loop spams managers (the KIN-600 pattern).
   async function isDeterministicCoordinationWatchCadence(
     sourceIssue: IssueRow,
-    terminalRuns: HeartbeatRunRow[],
+    // Structural subset, not HeartbeatRunRow: upstream narrowed the latestRuns select
+    // for cost, and demanding the full row coupled this helper to columns it never reads.
+    terminalRuns: Array<Pick<HeartbeatRunRow, "startedAt" | "createdAt" | "status" | "nextAction">>,
     since: Date,
   ) {
     const windowRuns = terminalRuns.filter(
@@ -496,6 +498,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         agentId: heartbeatRuns.agentId,
         status: heartbeatRuns.status,
         livenessState: heartbeatRuns.livenessState,
+        startedAt: heartbeatRuns.startedAt,
         createdAt: heartbeatRuns.createdAt,
         nextAction: heartbeatRuns.nextAction,
         usageJson: heartbeatRuns.usageJson,
