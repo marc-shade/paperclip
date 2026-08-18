@@ -11,14 +11,32 @@ const {
 } = vi.hoisted(() => ({
   prepareWorkspaceForSshExecution: vi.fn(async () => ({ gitBacked: false })),
   restoreWorkspaceFromSshExecution: vi.fn(async () => undefined),
-  runSshCommand: vi.fn(async () => ({
-    stdout: Buffer.from('{"token":"remote"}\n').toString("base64"),
-    stderr: "",
-  })),
+  // Command-aware: the workspace/asset capacity gates (remote-workspace-policy.js)
+  // also go through runSshCommand and parse a `capacity\t<available>\t<existing>`
+  // receipt. Returning the generic token for those made the gate throw
+  // 'capacity probe returned an invalid receipt'. Answer capacity probes with a
+  // plausible receipt (~1 TiB free, nothing existing) and everything else as before.
+  runSshCommand: vi.fn(async (...args: unknown[]) => {
+    const sent = JSON.stringify(args ?? "");
+    if (sent.includes("capacity")) {
+      return { stdout: `capacity\t${1024 ** 4}\t0\n`, stderr: "" };
+    }
+    return {
+      stdout: Buffer.from('{"token":"remote"}\n').toString("base64"),
+      stderr: "",
+    };
+  }),
   syncDirectoryToSsh: vi.fn(async (_input: { localDir: string }) => undefined),
 }));
 
-vi.mock("./ssh.js", () => ({
+// Partial mock via importOriginal: remote-managed-runtime pulls in
+// remote-workspace-policy.js (the workspace capacity gate), which imports other
+// live helpers from ./ssh.js such as shellQuote. A total mock listing only the four
+// stubbed functions makes those imports undefined at module-eval time and the suite
+// dies with 'No "shellQuote" export is defined on the "./ssh.js" mock'. Spreading the
+// real module keeps the mock complete as ssh.js grows.
+vi.mock("./ssh.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./ssh.js")>()),
   prepareWorkspaceForSshExecution,
   restoreWorkspaceFromSshExecution,
   runSshCommand,

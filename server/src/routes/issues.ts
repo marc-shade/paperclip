@@ -9589,8 +9589,20 @@ export function issueRoutes(
       // run can recover from a dormant scheduled_retry lock instead of 409ing. Deliberately
       // OUTSIDE the transaction below: that path is conditional
       // (shouldUseTransactionalIssueUpdate), and the reclaim must run on both branches.
-      await svc.clearExecutionRunIfTerminal(id);
-      await svc.clearCheckoutRunIfTerminal(id);
+      //
+      // BEST-EFFORT: these open their own db.transaction with `SELECT ... FOR UPDATE`. If that
+      // is unavailable (a caller with a narrower db handle), the reclaim must not convert an
+      // otherwise-valid PATCH into a 500 — fall through and let the update itself decide, which
+      // at worst restores the pre-ARC-5774 409. Logged, never swallowed silently.
+      try {
+        await svc.clearExecutionRunIfTerminal(id);
+        await svc.clearCheckoutRunIfTerminal(id);
+      } catch (reclaimError) {
+        req.log?.warn?.(
+          { err: reclaimError, issueId: id },
+          "stale-execution-lock reclaim failed; continuing with the update",
+        );
+      }
 
       if (shouldUseTransactionalIssueUpdate) {
         issue = await db.transaction(async (tx) => {

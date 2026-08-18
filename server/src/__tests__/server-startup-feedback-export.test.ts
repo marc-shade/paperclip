@@ -40,7 +40,13 @@ const {
       from: vi.fn(() => ({ where: vi.fn(async () => []) })),
     })),
   }) as never);
-  const detectPortMock = vi.fn(async (port: number) => port);
+  // detect-port 2.1.0 accepts `number | PortConfig | string`; the server passes
+  // { port, hostname } so the probe binds the configured host. Echo the port out of
+  // either shape — the positional-only mock returned the object and produced
+  // "http://127.0.0.1:[object Object]".
+  const detectPortMock = vi.fn(async (port: number | { port?: number }) =>
+    typeof port === "object" && port !== null ? port.port : port,
+  );
   const deriveAuthTrustedOriginsMock = vi.fn(() => []);
   const resolveHeartbeatSchedulingSuppressionMock = vi.fn(() => ({
     suppressed: false,
