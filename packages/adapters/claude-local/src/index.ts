@@ -6,8 +6,11 @@ export const label = "Claude Code";
 export const SANDBOX_INSTALL_COMMAND = "npm install -g @anthropic-ai/claude-code";
 
 export const models = [
-  { id: "claude-opus-5", label: "Claude Opus 5" },
+  // Opus 4.8 stays FIRST: adapter-models.test.ts asserts models[0] is the default
+  // option, and our local commit had inserted opus-5 ahead of it. Opus 5 is still
+  // offered, just not as the default.
   { id: "claude-opus-4-8", label: "Claude Opus 4.8" },
+  { id: "claude-opus-5", label: "Claude Opus 5" },
   { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
   { id: "claude-fable-5", label: "Claude Fable 5" },
   { id: "claude-mythos-5", label: "Claude Mythos 5" },

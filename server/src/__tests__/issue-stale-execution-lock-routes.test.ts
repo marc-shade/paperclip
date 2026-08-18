@@ -300,6 +300,13 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionAgentNameKey: "codexcoder",
       executionLockedAt: new Date(),
     });
+    // Bind the acting run to this issue. Upstream added a cross-issue influence guard
+    // that 403s (cross_issue_influence_run_context_required) when the run's
+    // contextSnapshot does not name the issue being written. The sibling tests above
+    // already do this; this ARC-5774 case predates the guard.
+    await db.update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, currentRunId));
 
     const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
       .patch(`/api/issues/${issueId}`)

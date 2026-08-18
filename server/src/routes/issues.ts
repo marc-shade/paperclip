@@ -10693,6 +10693,10 @@ export function issueRoutes(
       if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
         res.status(409).json({
           error: "Another execution for this routine is already in progress",
+          // Machine-readable discriminator. Upstream's handler returns only `error`;
+          // our clients and issue-stale-execution-lock-routes.test.ts key off `code`,
+          // so keep it alongside upstream's isUniqueViolation() detection.
+          code: "open_routine_execution_conflict",
         });
         return;
       }
