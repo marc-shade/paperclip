@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  boundHeartbeatRunResultJsonForStorage,
   summarizeHeartbeatRunResultJson,
   buildHeartbeatRunIssueComment,
+  HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
   mergeHeartbeatRunResultJson,
+  planHeartbeatRunResultRetention,
 } from "../services/heartbeat-run-summary.js";
 
 describe("summarizeHeartbeatRunResultJson", () => {
@@ -63,6 +66,59 @@ describe("buildHeartbeatRunIssueComment", () => {
   it("returns null when there is no usable final text", () => {
     expect(buildHeartbeatRunIssueComment({ costUsd: 1.2 })).toBeNull();
   });
+
+  it("suppresses raw transcript when the summary reads like inter-tool narration", () => {
+    const narration =
+      "Let me check the issue thread first. I'll fetch the latest comments and then decide what to do next.";
+    const comment = buildHeartbeatRunIssueComment({ summary: narration });
+
+    expect(comment).not.toContain("Let me check");
+    expect(comment).toContain("did not post a summary comment");
+  });
+
+  it("suppresses each narration opener variant", () => {
+    for (const opener of [
+      "Let me look into this.",
+      "I'll start by reading the file.",
+      "I need to inspect the config.",
+      "I can see the problem now.",
+      "Looking at the logs, the error is clear.",
+      "Fetching the run details from the API.",
+      "Checking the current branch state.",
+      "First, I will reproduce the bug.",
+      "I’m going to trace the fallback path.",
+      "Now I'll push the follow-up commit.",
+      "Next, I'll re-run the suite.",
+    ]) {
+      expect(buildHeartbeatRunIssueComment({ summary: opener })).toContain(
+        "did not post a summary comment",
+      );
+    }
+  });
+
+  it("does not treat the apostrophe opener as a regex wildcard", () => {
+    // Prior regex used `i.ll` where `.` matched any char; these must pass through.
+    for (const summary of ["Iall greetings logged.", "I-ll formatting kept."]) {
+      expect(buildHeartbeatRunIssueComment({ summary })).toBe(summary);
+    }
+  });
+
+  it("suppresses over-long fallback summaries even without a narration opener", () => {
+    const comment = buildHeartbeatRunIssueComment({ summary: "x".repeat(1201) });
+    expect(comment).toContain("did not post a summary comment");
+    expect(comment).not.toContain("xxxx");
+  });
+
+  it("posts a clean, in-length summary with no narration opener normally", () => {
+    const summary = "## Summary\n\n- fixed the fallback gate\n- added regression tests";
+    expect(buildHeartbeatRunIssueComment({ summary })).toBe(summary);
+  });
+
+  it("posts a summary exactly at the length cap", () => {
+    const summary = "S" + "x".repeat(1199);
+    expect(summary.length).toBe(1200);
+    expect(buildHeartbeatRunIssueComment({ summary })).toBe(summary);
+  });
 });
 
 describe("mergeHeartbeatRunResultJson", () => {
@@ -94,5 +150,90 @@ describe("mergeHeartbeatRunResultJson", () => {
       summary: "adapter result",
       stdout: "raw stdout",
     });
+  });
+});
+
+describe("boundHeartbeatRunResultJsonForStorage", () => {
+  const receipt = {
+    store: "local_file",
+    ref: "company/agent/run.ndjson",
+    bytes: 2_000_000,
+    sha256: "a".repeat(64),
+    compressed: false,
+  };
+
+  it("leaves small result payloads on the compatibility path", () => {
+    expect(planHeartbeatRunResultRetention({ summary: "done", structured: { ok: true } })).toBeNull();
+  });
+
+  it("removes duplicated streams while preserving operational metadata and log custody", () => {
+    const resultJson = {
+      stdout: "stdout-line\n".repeat(20_000),
+      stderr: "stderr-line\n".repeat(10_000),
+      summary: "completed",
+      errorFamily: "provider_quota",
+      providerExhausted: true,
+      retryNotBefore: "2026-08-14T00:00:00.000Z",
+      configFreshness: { version: 1, session: { reset: false } },
+    };
+    const plan = planHeartbeatRunResultRetention(resultJson);
+    expect(plan).not.toBeNull();
+
+    const bounded = boundHeartbeatRunResultJsonForStorage({ resultJson, plan: plan!, receipt });
+    const marker = bounded.paperclipResultRetention as Record<string, unknown>;
+
+    expect(bounded).toMatchObject({
+      summary: "completed",
+      errorFamily: "provider_quota",
+      providerExhausted: true,
+      retryNotBefore: "2026-08-14T00:00:00.000Z",
+      configFreshness: { version: 1, session: { reset: false } },
+    });
+    expect(bounded).not.toHaveProperty("stdout");
+    expect(bounded).not.toHaveProperty("stderr");
+    expect(marker).toMatchObject({
+      version: "heartbeat_result_retention.v1",
+      truncated: true,
+      reason: "oversized_result_json",
+      omittedFields: ["stdout", "stderr"],
+      omittedFieldCount: 2,
+      custody: {
+        kind: "heartbeat_run_log",
+        store: "local_file",
+        ref: "company/agent/run.ndjson",
+        bytes: 2_000_000,
+        sha256: "a".repeat(64),
+        compressed: false,
+        apiPath: "log",
+      },
+    });
+    expect(marker.originalBytes).toBe(plan?.originalBytes);
+    expect(marker.originalSha256).toBe(plan?.originalSha256);
+    expect(Buffer.byteLength(JSON.stringify(bounded), "utf8")).toBeLessThanOrEqual(
+      HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
+    );
+  });
+
+  it("falls back to priority metadata when non-stream fields exceed the byte budget", () => {
+    const resultJson = {
+      stdout: "x".repeat(80_000),
+      summary: "s".repeat(80_000),
+      stopReason: "completed",
+      timeoutConfigured: false,
+      nestedHuge: { payload: "n".repeat(120_000) },
+      smallStructured: { kept: true },
+    };
+    const plan = planHeartbeatRunResultRetention(resultJson)!;
+    const bounded = boundHeartbeatRunResultJsonForStorage({ resultJson, plan, receipt });
+    const marker = bounded.paperclipResultRetention as Record<string, unknown>;
+
+    expect(bounded.summary).toBe("s".repeat(500));
+    expect(bounded.stopReason).toBe("completed");
+    expect(bounded.timeoutConfigured).toBe(false);
+    expect(bounded).not.toHaveProperty("nestedHuge");
+    expect(marker.omittedFields).toEqual(expect.arrayContaining(["stdout", "nestedHuge"]));
+    expect(Buffer.byteLength(JSON.stringify(bounded), "utf8")).toBeLessThanOrEqual(
+      HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
+    );
   });
 });

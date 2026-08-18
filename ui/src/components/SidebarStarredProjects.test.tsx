@@ -135,8 +135,10 @@ describe("SidebarStarredProjects", () => {
       agentMemberships: {},
       starredProjectIds: [],
       starredAgentIds: [],
+      starredDocumentIds: [],
       projectStarredAt: {},
       agentStarredAt: {},
+      documentStarredAt: {},
       updatedAt: null,
     };
     mockResourceMembershipsApi.listMine.mockImplementation(() => Promise.resolve(memberships));
@@ -165,17 +167,16 @@ describe("SidebarStarredProjects", () => {
     await flushReact();
   }
 
-  it("renders only starred, non-archived projects with a quiet unstar control", async () => {
+  it("renders only starred projects returned by the default active project list", async () => {
     mockProjectsApi.list.mockResolvedValue([
       makeProject({ id: "project-a", name: "Alpha", urlKey: "alpha" }),
       makeProject({ id: "project-b", name: "Bravo", urlKey: "bravo" }),
-      makeProject({ id: "project-c", name: "Ghost", urlKey: "ghost", archivedAt: new Date() }),
     ]);
     memberships = { ...memberships, starredProjectIds: ["project-b", "project-c"] };
 
     await render();
 
-    // Only the starred, non-archived project renders (archived "Ghost" is filtered out).
+    // project-c is starred but absent because the default project list is server-filtered.
     expect(projectLinkLabels(container)).toEqual(["Bravo"]);
     expect(document.body.querySelector('button[aria-label="Unstar Bravo"]')).not.toBeNull();
   });
@@ -188,7 +189,7 @@ describe("SidebarStarredProjects", () => {
 
     await render();
 
-    expect(projectLink(container, "alpha")?.className).toContain("pl-8");
+    expect(projectLink(container, "alpha")?.className).toContain("pl-6");
 
     await act(async () => root?.unmount());
     root = null;
@@ -199,7 +200,7 @@ describe("SidebarStarredProjects", () => {
     await render();
 
     const railProjectLink = projectLink(container, "alpha");
-    expect(railProjectLink?.className).not.toContain("pl-8");
+    expect(railProjectLink?.className).not.toContain("pl-6");
     const nameSpan = Array.from(container.querySelectorAll("span")).find((el) => el.textContent === "Alpha");
     expect(nameSpan?.className).toContain("w-0");
   });

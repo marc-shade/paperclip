@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -35,8 +35,15 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/index.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
+import {
+  WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
+  WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
+  WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
+} from "../services/execution-workspace-policy.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -165,13 +172,20 @@ async function waitForRunToFinish(heartbeat: Heartbeat, runId: string, timeoutMs
   return heartbeat.getRun(runId);
 }
 
-async function waitForHeartbeatIdle(db: Db, timeoutMs = 5_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const runs = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns);
-    if (!runs.some((run) => run.status === "queued" || run.status === "running")) return;
-    await new Promise((resolve) => setTimeout(resolve, 50));
+async function deleteHeartbeatRunsForCleanup(db: Db) {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    await db.delete(heartbeatRunEvents);
+    await db.delete(activityLog);
+    try {
+      await db.delete(heartbeatRuns);
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
   }
+  throw lastError;
 }
 
 async function waitForContainmentSideEffects(input: {
@@ -208,7 +222,7 @@ async function waitForContainmentSideEffects(input: {
     const hasRecoveryActionComment = recoveryActionId
       ? comments.some((comment) =>
           comment.issueId === input.sourceIssueId &&
-          comment.body.includes(`Recovery action: \`${recoveryActionId}\``))
+          noticeMetadataReferencesRecoveryAction(comment.metadata, recoveryActionId))
       : false;
     if (
       source?.status === "blocked" &&
@@ -274,6 +288,10 @@ function readAdapterWorkspace(input: unknown) {
     typeof context.executionWorkspaceId === "string" ? context.executionWorkspaceId : null;
   if (!cwd || !branchName || !executionWorkspaceId) {
     throw new Error("Adapter input is missing execution workspace context");
+  }
+  const wake = context.paperclipWake as { executionWorkspace?: { branchName?: string } } | undefined;
+  if (wake?.executionWorkspace?.branchName !== branchName) {
+    throw new Error("Adapter wake payload is missing the execution workspace branch pin");
   }
   return { cwd, branchName, executionWorkspaceId };
 }
@@ -662,12 +680,16 @@ async function expectContainedWorkspaceBranchFailure(input: {
     }),
     nextAction: expect.stringContaining("choose a new execution workspace"),
     wakePolicy: expect.objectContaining({
-      type: "manual_repair_required",
-      reason: "workspace_validation_failed",
+      type: "wake_owner",
+      reason: "source_scoped_recovery_action",
+      ownerAgentId: expect.any(String),
     }),
   });
 
-  expect(comments.filter((comment) => comment.issueId === input.sourceIssueId && comment.body.includes(`Recovery action: \`${action.id}\``))).toHaveLength(1);
+  expect(comments.filter((comment) =>
+    comment.issueId === input.sourceIssueId &&
+    noticeMetadataReferencesRecoveryAction(comment.metadata, action.id),
+  )).toHaveLength(1);
   expect(comments.filter((comment) => comment.issueId === input.sameWorkspaceSiblingId)).toHaveLength(0);
   expect(comments.filter((comment) => comment.issueId === input.otherWorkspaceSiblingId)).toHaveLength(0);
 }
@@ -722,8 +744,8 @@ async function expectForwardBranchReconciled(input: {
   expect(activeWorkspace).toMatchObject({
     name: expectedDurableBranch,
     branchName: expectedDurableBranch,
-    providerRef: input.worktreePath,
   });
+  expect(await realpath(activeWorkspace.providerRef!)).toBe(await realpath(input.worktreePath));
 
   const recoveryRows = await input.db
     .select()
@@ -794,14 +816,10 @@ async function expectForwardBranchReconciled(input: {
       ]),
     );
     if (resolvedRecoveryActionId) {
-      expect(comments).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            authorType: "system",
-            body: expect.stringContaining(`Recovery action: \`${resolvedRecoveryActionId}\``),
-          }),
-        ]),
-      );
+      expect(comments.some((comment) =>
+        comment.authorType === "system" &&
+        noticeMetadataReferencesRecoveryAction(comment.metadata, resolvedRecoveryActionId),
+      )).toBe(true);
     }
 
     const activities = await input.db
@@ -843,7 +861,14 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
   }, 20_000);
 
   afterEach(async () => {
-    await waitForHeartbeatIdle(db);
+    // Await every in-flight background heartbeat run to quiescence before the
+    // deletes below. resumeQueuedRuns claims a run and dispatches its execution
+    // fire-and-forget, and the containment path can dispatch a follow-up
+    // recovery wakeup, so a run or wakeup can still write heartbeat_runs and
+    // issues rows when teardown starts. The shared drain also awaits an
+    // in-flight wakeup that is still before run registration, which a plain run
+    // table status poll cannot see.
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
     adapterExecute.mockReset();
     adapterExecute.mockImplementation(async () => ({
       exitCode: 0,
@@ -866,10 +891,9 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
     await db.delete(environmentLeases);
     await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
-    // Heartbeat failure/finalization paths can emit run-linked activity after
-    // the first cleanup pass observes all runs as non-active.
-    await db.delete(activityLog);
-    await db.delete(heartbeatRuns);
+    // Heartbeat failure/finalization paths can emit run-linked events and
+    // activity after the first cleanup pass observes all runs as non-active.
+    await deleteHeartbeatRunsForCleanup(db);
     await db.delete(issueComments);
     await db.delete(issues);
     await db.delete(projectWorkspaces);
@@ -887,6 +911,131 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
   afterAll(async () => {
     await db.$client.end();
     await tempDb?.cleanup();
+  }, 60_000);
+
+  it("blocks projectless isolated git-worktree issues before dispatch", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const issueIdentifier = `${issuePrefix}-1`;
+
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Acme",
+      issuePrefix,
+      status: "active",
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Projectless isolated worktree",
+      status: "todo",
+      workMode: "standard",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: issueIdentifier,
+      executionWorkspaceSettings: {
+        mode: "isolated_workspace",
+        workspaceStrategy: { type: "git_worktree" },
+      },
+    });
+
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+
+    expect(run).toBeNull();
+    expect(adapterExecute).not.toHaveBeenCalled();
+
+    const runRows = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
+    expect(runRows).toEqual([]);
+
+    const blockedIssue = await db
+      .select({
+        status: issues.status,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionAgentNameKey: issues.executionAgentNameKey,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(blockedIssue).toEqual({
+      status: "blocked",
+      checkoutRunId: null,
+      executionRunId: null,
+      executionAgentNameKey: null,
+    });
+
+    const wakeup = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup).toMatchObject({
+      status: "skipped",
+      reason: WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
+    });
+    expect(asRecord(asRecord(wakeup?.payload).heartbeatSkip)).toEqual({
+      code: WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
+      reason: WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
+      remediation: WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
+    });
+
+    const comment = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(comment?.body).toContain(WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE);
+
+    const activity = await db
+      .select({
+        action: activityLog.action,
+        details: activityLog.details,
+      })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(activity?.action).toBe("issue.workspace_preflight_blocked");
+    expect(activity?.details).toMatchObject({
+      code: WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
+      reason: WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
+      remediation: WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
+      resolvedMode: "isolated_workspace",
+      resolvedStrategy: "git_worktree",
+      hasResolvablePriorSessionWorkspace: false,
+    });
   });
 
   it.each([

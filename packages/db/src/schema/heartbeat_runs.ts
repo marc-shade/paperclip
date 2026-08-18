@@ -122,8 +122,23 @@ export const heartbeatRuns = pgTable(
     // it the run-listing endpoints sort the whole table and evaluate their
     // context_snapshot projections below the Sort node — a full-table de-TOAST
     // on every call.
-    companyCreatedIdx: index("heartbeat_runs_company_created_idx").on(
+    companyCreatedAtDescIdx: index("heartbeat_runs_company_created_at_desc_idx").on(
       table.companyId,
+      table.createdAt.desc(),
+    ),
+    companyCtxIssueCreatedIdx: index("heartbeat_runs_company_ctx_issue_created_idx").on(
+      table.companyId,
+      sql`(${table.contextSnapshot} ->> 'issueId')`,
+      table.createdAt.desc(),
+    ),
+    companyCtxTaskCreatedIdx: index("heartbeat_runs_company_ctx_task_created_idx").on(
+      table.companyId,
+      sql`(${table.contextSnapshot} ->> 'taskId')`,
+      table.createdAt.desc(),
+    ),
+    companyCtxTaskKeyCreatedIdx: index("heartbeat_runs_company_ctx_taskkey_created_idx").on(
+      table.companyId,
+      sql`(${table.contextSnapshot} ->> 'taskKey')`,
       table.createdAt.desc(),
     ),
   }),

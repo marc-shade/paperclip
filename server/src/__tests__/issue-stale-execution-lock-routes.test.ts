@@ -147,6 +147,9 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionAgentNameKey: "codexcoder",
       executionLockedAt: new Date(),
     });
+    await db.update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, currentRunId));
 
     const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
       .patch(`/api/issues/${issueId}`)
@@ -170,6 +173,59 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionRunId: currentRunId,
     });
   });
+
+  it.each([
+    { status: "done" as const, title: "Done release preserves status", completedAt: new Date() },
+    { status: "cancelled" as const, title: "Cancelled release preserves status", cancelledAt: new Date() },
+    { status: "in_review" as const, title: "In review release preserves status" },
+    { status: "blocked" as const, title: "Blocked release preserves status" },
+  ])(
+    "preserves $status when releasing a non-in_progress issue",
+    async ({ status, title, completedAt, cancelledAt }) => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title,
+        status,
+        priority: "medium",
+        assigneeAgentId: agentId,
+        checkoutRunId: currentRunId,
+        executionRunId: currentRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+        ...(completedAt ? { completedAt } : {}),
+        ...(cancelledAt ? { cancelledAt } : {}),
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .post(`/api/issues/${issueId}/release`)
+        .send();
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.status).toBe(status);
+
+      const row = await db
+        .select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+          executionLockedAt: issues.executionLockedAt,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        status,
+        assigneeAgentId: null,
+        checkoutRunId: null,
+        executionRunId: null,
+        executionLockedAt: null,
+      });
+    },
+  );
 
   it("allows the rightful assignee to release after the owning run failed", async () => {
     const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
@@ -213,6 +269,233 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     });
   });
 
+  // ARC-5774: a scheduled_retry run is dormant (parked for hours/days at the provider's
+  // reset time) but was previously treated as "live" for lock purposes, so a fresh live
+  // run from the same assignee got 409'd forever on checkout/PATCH/release. These three
+  // tests cover all three write paths reported stuck against a dormant scheduled_retry
+  // executionRunId/checkoutRunId.
+  it("allows an assigned agent PATCH to recover a scheduled_retry stale executionRunId (ARC-5774)", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const dormantRetryRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: dormantRetryRunId,
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      invocationSource: "automation",
+      scheduledRetryAt: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000),
+      scheduledRetryAttempt: 3,
+      scheduledRetryReason: "transient_failure",
+    });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Dormant scheduled_retry execution lock",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: dormantRetryRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+    // Bind the acting run to this issue. Upstream added a cross-issue influence guard
+    // that 403s (cross_issue_influence_run_context_required) when the run's
+    // contextSnapshot does not name the issue being written. The sibling tests above
+    // already do this; this ARC-5774 case predates the guard.
+    await db.update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, currentRunId));
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.status).toBe("done");
+
+    const row = await db
+      .select({
+        status: issues.status,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      status: "done",
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+
+    // The dormant run itself is untouched — if it ever fires later it will simply find
+    // the lock already gone and not double-process a done issue.
+    const [dormantRun] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, dormantRetryRunId));
+    expect(dormantRun.status).toBe("scheduled_retry");
+  });
+
+  it("self-heals a scheduled_retry checkoutRunId on checkout for the same assignee (ARC-5774)", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const dormantRetryRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: dormantRetryRunId,
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      invocationSource: "automation",
+      scheduledRetryAt: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000),
+      scheduledRetryAttempt: 3,
+      scheduledRetryReason: "transient_failure",
+    });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Dormant scheduled_retry checkout lock",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      checkoutRunId: dormantRetryRunId,
+      executionRunId: dormantRetryRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({
+        agentId,
+        expectedStatuses: ["todo", "backlog", "blocked", "in_review", "in_progress"],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const row = await db
+      .select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+    });
+  });
+
+  it("allows the rightful assignee to release after the owning run parked in scheduled_retry (ARC-5774)", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const dormantRetryRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: dormantRetryRunId,
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      invocationSource: "automation",
+      scheduledRetryAt: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000),
+      scheduledRetryAttempt: 3,
+      scheduledRetryReason: "transient_failure",
+    });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Dormant scheduled_retry release",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: agentId,
+      checkoutRunId: dormantRetryRunId,
+      executionRunId: dormantRetryRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/release`)
+      .send();
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const row = await db
+      .select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      status: "todo",
+      assigneeAgentId: null,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+  });
+
+  it("still 409s a scheduled_retry executionRunId owned by a different agent (ARC-5774 safety)", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId,
+      name: "OtherAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const dormantRetryRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: dormantRetryRunId,
+      companyId,
+      agentId: otherAgentId,
+      status: "scheduled_retry",
+      invocationSource: "automation",
+      scheduledRetryAt: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000),
+      scheduledRetryAttempt: 3,
+      scheduledRetryReason: "transient_failure",
+    });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Dormant scheduled_retry owned by another assignee",
+      status: "in_progress",
+      priority: "critical",
+      assigneeAgentId: otherAgentId,
+      checkoutRunId: null,
+      executionRunId: dormantRetryRunId,
+      executionAgentNameKey: "otheragent",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done" });
+
+    // Reclaim is scoped to the SAME assignee (or an unassigned issue) — a scheduled_retry
+    // lock owned by a different agent's assignment must not be stolen just because it is
+    // dormant. The actor's own authorization-boundary check (not assignee/company-scoped
+    // to this issue) fires before the lock-reclaim logic and rejects with 403; either way
+    // the PATCH must not succeed.
+    expect([403, 409]).toContain(res.status);
+    expect(res.status, JSON.stringify(res.body)).not.toBe(200);
+  });
+
   it("lets the current assignee recover a timed_out stale checkout owner during PATCH", async () => {
     const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
     const timedOutRunId = randomUUID();
@@ -237,6 +520,9 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionAgentNameKey: "codexcoder",
       executionLockedAt: new Date(),
     });
+    await db.update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, currentRunId));
 
     const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
       .patch(`/api/issues/${issueId}`)
@@ -379,7 +665,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       source: "session",
     }))
       .post(`/api/issues/${issueId}/admin/force-release`)
-      .expect(403);
+      .expect(404);
 
     const res = await request(createApp(boardActor(companyId)))
       .post(`/api/issues/${issueId}/admin/force-release?clearAssignee=true`)

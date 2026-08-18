@@ -358,6 +358,7 @@ describeEmbeddedPostgres("heartbeat provider cascade failover", () => {
       id: input.companyId,
       name: "Paperclip",
       issuePrefix: `T${input.companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "local-board",
       requireBoardApprovalForNewAgents: false,
     });
 
@@ -381,6 +382,7 @@ describeEmbeddedPostgres("heartbeat provider cascade failover", () => {
       companyId: input.companyId,
       agentId: input.agentId,
       invocationSource: "assignment",
+      responsibleUserId: "local-board",
       status: "failed",
       error: input.error ?? "usage limit reached",
       errorCode: input.errorCode,

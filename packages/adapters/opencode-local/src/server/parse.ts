@@ -99,3 +99,12 @@ export function isOpenCodeUnknownSessionError(stdout: string, stderr: string): b
     haystack,
   );
 }
+
+// OpenCode session IDs are always "ses_...". A stored sessionId in any other
+// shape (e.g. a Claude Code UUID left over from a prior adapter on the same
+// agent) can never resume an OpenCode session and would otherwise burn one
+// guaranteed-failed `opencode --session <id>` attempt before the
+// isOpenCodeUnknownSessionError retry path recovers.
+export function isOpenCodeSessionId(sessionId: string): boolean {
+  return /^ses_[a-zA-Z0-9]+$/.test(sessionId);
+}

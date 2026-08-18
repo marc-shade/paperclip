@@ -1,4 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useLocation } from "@/lib/router";
+import {
+  onboardingStepForCompany,
+  shouldRouteAgentlessCompanyToOnboarding,
+} from "../lib/onboarding-route";
+import { useCompanyMission } from "../hooks/useCompanyMission";
+import { claimOnboardingOffer } from "../lib/onboarding-auto-open";
 import { Link } from "@/lib/router";
 import { useQuery } from "@tanstack/react-query";
 import { dashboardApi } from "../api/dashboard";
@@ -15,17 +22,21 @@ import { queryKeys } from "../lib/queryKeys";
 import { MetricCard } from "../components/MetricCard";
 import { EmptyState } from "../components/EmptyState";
 import { StatusIcon } from "../components/StatusIcon";
+import { usePublishSharedQueryData, useSharedPollingQuery } from "../hooks/useSharedPolling";
 
 import { ActivityRow } from "../components/ActivityRow";
 import { Identity } from "../components/Identity";
 import { timeAgo } from "../lib/timeAgo";
 import { cn, formatCents } from "../lib/utils";
+import { SHOW_TASK_PRIORITY_UI } from "../lib/ui-flags";
 import { Bot, CircleDot, DollarSign, ShieldCheck, LayoutDashboard, PauseCircle } from "lucide-react";
 import { ActiveAgentsPanel } from "../components/ActiveAgentsPanel";
 import { ChartCard, RunActivityChart, PriorityChart, IssueStatusChart, SuccessRateChart } from "../components/ActivityCharts";
 import { PageSkeleton } from "../components/PageSkeleton";
+import { Card } from "@/components/ui/card";
 import type { Agent, Issue } from "@paperclipai/shared";
 import { PluginSlotOutlet } from "@/plugins/slots";
+import { SmokeLabDashboardCard } from "../components/SmokeLabDashboardCard";
 
 const DASHBOARD_ACTIVITY_LIMIT = 10;
 
@@ -37,6 +48,7 @@ function getRecentIssues(issues: Issue[]): Issue[] {
 export function Dashboard() {
   const { selectedCompanyId, companies } = useCompany();
   const { openOnboarding } = useDialogActions();
+  const location = useLocation();
   const { setBreadcrumbs } = useBreadcrumbs();
   const [animatedActivityIds, setAnimatedActivityIds] = useState<Set<string>>(new Set());
   const seenActivityIdsRef = useRef<Set<string>>(new Set());
@@ -49,21 +61,80 @@ export function Dashboard() {
     enabled: !!selectedCompanyId,
   });
 
+  // A company with no agent cannot do anything — no runs, no tasks, nothing
+  // to show. The banner below already says so and offers a link; this takes
+  // the customer there instead of asking them to notice.
+  //
+  // It also closes the gap a Cloud-provisioned stack falls into. Cloud creates
+  // the company before the tenant boots, so the companyless redirect never
+  // fires and a seeded customer lands here, on an empty dashboard, straight
+  // out of signup.
+  //
+  // Opened as the dialog rather than navigated to: the wizard is already
+  // mounted globally, so there is no route to race and no redirect to loop.
+  // Placed with the other hooks — the early returns below mean anything
+  // further down would be called conditionally.
+  //
+  // The company and the step are both passed. Opening with empty options would
+  // start the wizard at the front door with no company, and the new-company
+  // path there would create a *second* company instead of giving this one an
+  // agent.
+  const { hasMission: companyHasMission, settled: missionSettled } =
+    useCompanyMission(selectedCompanyId);
+  const shouldOpenOnboarding = shouldRouteAgentlessCompanyToOnboarding({
+    pathname: location.pathname,
+    agentsLoaded: agents !== undefined,
+    agentCount: agents?.length ?? 0,
+  });
+  // Auto-open once per company. Every input to the effect sits behind a query,
+  // so a refetch re-runs it, and the customer can also navigate away and come
+  // back — both would otherwise call `openOnboarding` again and reopen a
+  // wizard that was deliberately closed. `claimOnboardingOffer` holds the
+  // companies already offered; see it for why that outlives this component.
+  useEffect(() => {
+    if (!shouldOpenOnboarding || !selectedCompanyId) return;
+    // Wait for the mission lookup to settle before opening: the wizard applies
+    // the step it is given once, so a step chosen before the answer is in is
+    // the step the customer is left on.
+    if (!missionSettled) return;
+    if (!claimOnboardingOffer(selectedCompanyId)) return;
+    openOnboarding({
+      companyId: selectedCompanyId,
+      initialStep: onboardingStepForCompany(companyHasMission),
+    });
+  }, [shouldOpenOnboarding, selectedCompanyId, missionSettled, companyHasMission, openOnboarding]);
+
   useEffect(() => {
     setBreadcrumbs([{ label: "Dashboard" }]);
   }, [setBreadcrumbs]);
 
-  const { data, isLoading, error } = useQuery({
-    queryKey: queryKeys.dashboard(selectedCompanyId!),
+  const dashboardQueryKey = queryKeys.dashboard(selectedCompanyId!);
+  const sharedDashboard = useSharedPollingQuery({
+    companyId: selectedCompanyId,
+    resourceKey: "dashboard",
+    queryKey: dashboardQueryKey,
+    enabled: !!selectedCompanyId,
+  });
+  const { data, isLoading, error, dataUpdatedAt: dashboardUpdatedAt } = useQuery({
+    queryKey: dashboardQueryKey,
     queryFn: () => dashboardApi.summary(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
+  usePublishSharedQueryData(sharedDashboard, data, dashboardUpdatedAt);
 
-  const { data: activity } = useQuery({
-    queryKey: [...queryKeys.activity(selectedCompanyId!), { limit: DASHBOARD_ACTIVITY_LIMIT }],
+  const activityQueryKey = [...queryKeys.activity(selectedCompanyId!), { limit: DASHBOARD_ACTIVITY_LIMIT }] as const;
+  const sharedActivity = useSharedPollingQuery({
+    companyId: selectedCompanyId,
+    resourceKey: `activity:limit:${DASHBOARD_ACTIVITY_LIMIT}`,
+    queryKey: activityQueryKey,
+    enabled: !!selectedCompanyId,
+  });
+  const { data: activity, dataUpdatedAt: activityUpdatedAt } = useQuery({
+    queryKey: activityQueryKey,
     queryFn: () => activityApi.list(selectedCompanyId!, { limit: DASHBOARD_ACTIVITY_LIMIT }),
     enabled: !!selectedCompanyId,
   });
+  usePublishSharedQueryData(sharedActivity, activity, activityUpdatedAt);
 
   const { data: issues } = useQuery({
     queryKey: queryKeys.issues.list(selectedCompanyId!),
@@ -72,8 +143,8 @@ export function Dashboard() {
   });
 
   const { data: projects } = useQuery({
-    queryKey: queryKeys.projects.list(selectedCompanyId!),
-    queryFn: () => projectsApi.list(selectedCompanyId!),
+    queryKey: queryKeys.projects.list(selectedCompanyId!, { includeArchived: true }),
+    queryFn: () => projectsApi.list(selectedCompanyId!, { includeArchived: true }),
     enabled: !!selectedCompanyId,
   });
 
@@ -291,13 +362,18 @@ export function Dashboard() {
             />
           </div>
 
+          <SmokeLabDashboardCard companyId={selectedCompanyId!} />
+
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
             <ChartCard title="Run Activity" subtitle="Last 14 days">
               <RunActivityChart activity={data.runActivity} />
             </ChartCard>
-            <ChartCard title="Tasks by Priority" subtitle="Last 14 days">
-              <PriorityChart issues={issues ?? []} />
-            </ChartCard>
+            {/* PAP-411: "Tasks by Priority" chart hidden behind SHOW_TASK_PRIORITY_UI. */}
+            {SHOW_TASK_PRIORITY_UI && (
+              <ChartCard title="Tasks by Priority" subtitle="Last 14 days">
+                <PriorityChart issues={issues ?? []} />
+              </ChartCard>
+            )}
             <ChartCard title="Tasks by Status" subtitle="Last 14 days">
               <IssueStatusChart issues={issues ?? []} />
             </ChartCard>
@@ -310,6 +386,7 @@ export function Dashboard() {
             slotTypes={["dashboardWidget"]}
             context={{ companyId: selectedCompanyId }}
             className="grid gap-4 md:grid-cols-2"
+            // design-allow(card-pattern): class-string prop consumed by the plugin outlet; a component can't be passed here (C5a Run 3)
             itemClassName="rounded-lg border bg-card p-4 shadow-sm"
           />
 
@@ -320,7 +397,7 @@ export function Dashboard() {
                 <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide mb-3">
                   Recent Activity
                 </h3>
-                <div className="border border-border divide-y divide-border overflow-hidden">
+                <Card className="block py-0 divide-y divide-border overflow-hidden">
                   {recentActivity.map((event) => (
                     <ActivityRow
                       key={event.id}
@@ -332,7 +409,7 @@ export function Dashboard() {
                       className={animatedActivityIds.has(event.id) ? "activity-row-enter" : undefined}
                     />
                   ))}
-                </div>
+                </Card>
               </div>
             )}
 
@@ -342,11 +419,11 @@ export function Dashboard() {
                 Recent Tasks
               </h3>
               {recentIssues.length === 0 ? (
-                <div className="border border-border p-4">
+                <Card className="block p-4">
                   <p className="text-sm text-muted-foreground">No tasks yet.</p>
-                </div>
+                </Card>
               ) : (
-                <div className="border border-border divide-y divide-border overflow-hidden">
+                <Card className="block py-0 divide-y divide-border overflow-hidden">
                   {recentIssues.slice(0, 10).map((issue) => (
                     <Link
                       key={issue.id}
@@ -384,7 +461,7 @@ export function Dashboard() {
                       </div>
                     </Link>
                   ))}
-                </div>
+                </Card>
               )}
             </div>
           </div>
