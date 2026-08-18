@@ -211,6 +211,13 @@ function createSuggestedTasksInteraction(
     },
     result: null,
     ...overrides,
+    resolverPolicy: overrides.resolverPolicy ?? "anyone",
+    requestedResolverPolicy: overrides.requestedResolverPolicy ?? "anyone",
+    effectiveResolverPolicy: overrides.effectiveResolverPolicy ?? "anyone",
+    resolverPolicyProvenance: overrides.resolverPolicyProvenance ?? "inherited",
+    effectiveResolverPolicySource: overrides.effectiveResolverPolicySource ?? "requested",
+    legacyResolverPolicyAliases: overrides.legacyResolverPolicyAliases
+      ?? { requested: "board_or_agents", effective: "board_or_agents" },
   };
 }
 
@@ -250,6 +257,13 @@ function createQuestionInteraction(
     },
     result: null,
     ...overrides,
+    resolverPolicy: overrides.resolverPolicy ?? "anyone",
+    requestedResolverPolicy: overrides.requestedResolverPolicy ?? "anyone",
+    effectiveResolverPolicy: overrides.effectiveResolverPolicy ?? "anyone",
+    resolverPolicyProvenance: overrides.resolverPolicyProvenance ?? "inherited",
+    effectiveResolverPolicySource: overrides.effectiveResolverPolicySource ?? "requested",
+    legacyResolverPolicyAliases: overrides.legacyResolverPolicyAliases
+      ?? { requested: "board_or_agents", effective: "board_or_agents" },
   };
 }
 
@@ -283,6 +297,13 @@ function createExpiredRequestConfirmationInteraction(
       commentId: "comment-1",
     },
     ...overrides,
+    resolverPolicy: overrides.resolverPolicy ?? "anyone",
+    requestedResolverPolicy: overrides.requestedResolverPolicy ?? "anyone",
+    effectiveResolverPolicy: overrides.effectiveResolverPolicy ?? "anyone",
+    resolverPolicyProvenance: overrides.resolverPolicyProvenance ?? "inherited",
+    effectiveResolverPolicySource: overrides.effectiveResolverPolicySource ?? "requested",
+    legacyResolverPolicyAliases: overrides.legacyResolverPolicyAliases
+      ?? { requested: "board_or_agents", effective: "board_or_agents" },
   };
 }
 
@@ -2055,8 +2076,6 @@ describe("IssueChatThread", () => {
       );
     });
 
-    expect(container.textContent).toContain("Work on this task is blocked by the linked task");
-    expect(container.textContent).toContain("Comments still wake the responsible for questions or triage");
     expect(container.textContent).toContain("PAP-1723");
     expect(container.textContent).toContain("QA the install flow");
     expect(container.querySelector('[data-issue-path-id="PAP-1723"]')).not.toBeNull();

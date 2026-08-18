@@ -2495,6 +2495,207 @@ rl.on("line", (line) => {
     }
   });
 
+  it("expires an abandoned unsigned ask-first request so a later retry can proceed", async () => {
+    // The gateway builds an ask-first request in two steps inside one call: it
+    // inserts the row with a null signature and a null expiry, then signs the
+    // row. If the gateway stops between the two steps, the row stays pending
+    // and unsigned forever, and the review queue hides it. A later retry of the
+    // same tool call must not replay that dead row. It must expire the row and
+    // create a fresh, signable request.
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
+      body: {
+        jsonrpc: "2.0",
+        id: fakeRequest.body?.id,
+        result: { content: [{ type: "text", text: "should not run while pending approval" }] },
+      },
+    }));
+
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "abandoned-unsigned-app",
+        toolName: "kv_set",
+        url: fake.url,
+      });
+      const remoteToolName = expectedConnectedToolName({
+        applicationKey: remoteTool.application.applicationKey,
+        connectionId: remoteTool.connection.id,
+        toolName: remoteTool.catalogEntry.toolName,
+      });
+      await allowToolsForAgent(db, company.id, agent.id, [remoteToolName]);
+      await db.insert(toolPolicies).values({
+        companyId: company.id,
+        name: "Review abandoned connected writes",
+        policyType: "require_approval",
+        selectors: { connectionId: remoteTool.connection.id },
+        priority: 10,
+      });
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      await gateway.executeTool({
+        sessionToken: session.token,
+        tool: remoteToolName,
+        parameters: { key: "abandoned", value: "original" },
+      }).then(
+        () => {
+          throw new Error("Expected connected MCP call to require approval");
+        },
+        (error) => expectGatewayError(error, 409, "approval_required"),
+      );
+
+      const [firstRequest] = await db
+        .select()
+        .from(toolActionRequests)
+        .where(eq(toolActionRequests.companyId, company.id));
+
+      // Rewind the row to the abandoned state: created long ago, pending, never
+      // signed. The old createdAt proves the create stopped, not that a parallel
+      // create still runs, so a later retry can expire the row.
+      await db
+        .update(toolActionRequests)
+        .set({
+          signedArguments: null,
+          expiresAt: null,
+          interactionId: null,
+          createdAt: new Date(Date.now() - 10 * 60 * 1000),
+          updatedAt: new Date(),
+        })
+        .where(eq(toolActionRequests.id, firstRequest.id));
+
+      // Retry the same tool call. The gateway must not replay the dead row.
+      await gateway.executeTool({
+        sessionToken: session.token,
+        tool: remoteToolName,
+        parameters: { key: "abandoned", value: "original" },
+      }).then(
+        () => {
+          throw new Error("Expected retry to require a fresh approval");
+        },
+        (error) => expectGatewayError(error, 409, "approval_required"),
+      );
+
+      // The abandoned row is expired, not replayed as a live approval.
+      const [afterRetry] = await db
+        .select()
+        .from(toolActionRequests)
+        .where(eq(toolActionRequests.id, firstRequest.id));
+      expect(afterRetry.status).toBe("expired");
+
+      // The retry created a fresh, signed request that the queue can show.
+      const allRequests = await db
+        .select()
+        .from(toolActionRequests)
+        .where(eq(toolActionRequests.companyId, company.id));
+      const freshRequest = allRequests.find((request) => request.id !== firstRequest.id);
+      expect(freshRequest).toBeTruthy();
+      expect(freshRequest!.status).toBe("pending");
+      expect(freshRequest!.signedArguments).not.toBeNull();
+      expect(freshRequest!.expiresAt).not.toBeNull();
+
+      // The tool never executed while the approval stayed pending.
+      expect(fake.requests).toHaveLength(0);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("does not expire a recent unsigned ask-first request that a parallel create still owns", async () => {
+    // The create signs the row in two steps. A concurrent matching call can see
+    // the row after the insert but before the sign. A recent createdAt means a
+    // parallel create still runs, so the concurrent call must replay the live
+    // request. It must not expire the row and must not create a duplicate.
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
+      body: {
+        jsonrpc: "2.0",
+        id: fakeRequest.body?.id,
+        result: { content: [{ type: "text", text: "should not run while pending approval" }] },
+      },
+    }));
+
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "inflight-unsigned-app",
+        toolName: "kv_set",
+        url: fake.url,
+      });
+      const remoteToolName = expectedConnectedToolName({
+        applicationKey: remoteTool.application.applicationKey,
+        connectionId: remoteTool.connection.id,
+        toolName: remoteTool.catalogEntry.toolName,
+      });
+      await allowToolsForAgent(db, company.id, agent.id, [remoteToolName]);
+      await db.insert(toolPolicies).values({
+        companyId: company.id,
+        name: "Review inflight connected writes",
+        policyType: "require_approval",
+        selectors: { connectionId: remoteTool.connection.id },
+        priority: 10,
+      });
+
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      await gateway.executeTool({
+        sessionToken: session.token,
+        tool: remoteToolName,
+        parameters: { key: "inflight", value: "original" },
+      }).then(
+        () => {
+          throw new Error("Expected connected MCP call to require approval");
+        },
+        (error) => expectGatewayError(error, 409, "approval_required"),
+      );
+
+      const [firstRequest] = await db
+        .select()
+        .from(toolActionRequests)
+        .where(eq(toolActionRequests.companyId, company.id));
+
+      // Rewind to the in-flight window: unsigned, but created just now. This is
+      // the state a concurrent matching call sees while the create still runs.
+      await db
+        .update(toolActionRequests)
+        .set({ signedArguments: null, expiresAt: null, interactionId: null, updatedAt: new Date() })
+        .where(eq(toolActionRequests.id, firstRequest.id));
+
+      // The concurrent matching call replays the live request; it does not expire.
+      await gateway.executeTool({
+        sessionToken: session.token,
+        tool: remoteToolName,
+        parameters: { key: "inflight", value: "original" },
+      }).then(
+        () => {
+          throw new Error("Expected the concurrent call to require approval");
+        },
+        (error) => expectGatewayError(error, 409, "approval_required"),
+      );
+
+      // The row stays pending and is not expired.
+      const [afterRetry] = await db
+        .select()
+        .from(toolActionRequests)
+        .where(eq(toolActionRequests.id, firstRequest.id));
+      expect(afterRetry.status).toBe("pending");
+
+      // No duplicate request was created for the same tool call.
+      const allRequests = await db
+        .select()
+        .from(toolActionRequests)
+        .where(eq(toolActionRequests.companyId, company.id));
+      expect(allRequests).toHaveLength(1);
+
+      // The tool never executed while the approval stayed pending.
+      expect(fake.requests).toHaveLength(0);
+    } finally {
+      await fake.close();
+    }
+  });
+
   it("requires re-review when an approved connected MCP replay credential latest version changed", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
@@ -3517,7 +3718,15 @@ rl.on("line", (line) => {
       "mcp-stdio-fixture:increment_counter",
       "mcp-stdio-fixture:runtime_status",
     ]);
-    const gateway = createTestToolGatewayService(db, { runtimeSupervisor: { idleTtlMs: 25 } });
+    // Drive idle-down off an injected clock so the assertions below do not
+    // depend on real wall-clock elapsing under 25ms (the source of the flake).
+    // The supervisor computes idleDeadlineAt = now() + idleTtlMs and reaps lazily
+    // on every listRuntimeSlots call, so a fixed clock keeps the slot alive until
+    // we deliberately advance past the TTL.
+    let clockMs = Date.now();
+    const gateway = createTestToolGatewayService(db, {
+      runtimeSupervisor: { idleTtlMs: 25, now: () => new Date(clockMs) },
+    });
     const session = await gateway.createSession({
       companyId: company.id,
       agentId: agent.id,
@@ -3540,6 +3749,7 @@ rl.on("line", (line) => {
     expect(firstData).toMatchObject({ lazyStarted: true, reusedRuntimeSlot: false, counter: 1 });
     expect(secondData).toMatchObject({ lazyStarted: false, reusedRuntimeSlot: true, counter: 1 });
     expect(secondData.slotId).toBe(firstData.slotId);
+    // Clock has not advanced past the deadline, so the slot is deterministically present.
     await expect(gateway.listRuntimeSlots(company.id)).resolves.toHaveLength(1);
     const [idleSlot] = await db.select().from(toolRuntimeSlots).where(eq(toolRuntimeSlots.companyId, company.id));
     expect(idleSlot).toMatchObject({
@@ -3554,7 +3764,8 @@ rl.on("line", (line) => {
       resourceLimits: expect.objectContaining({ memoryCeilingSupported: expect.any(Boolean) }),
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 35));
+    // Advance the injected clock past the idle TTL to deterministically reap the slot.
+    clockMs += 35;
     await expect(gateway.listRuntimeSlots(company.id)).resolves.toEqual([]);
     const [stoppedSlot] = await db.select().from(toolRuntimeSlots).where(eq(toolRuntimeSlots.id, idleSlot.id));
     expect(stoppedSlot).toMatchObject({

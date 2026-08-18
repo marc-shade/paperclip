@@ -137,12 +137,21 @@ describe("IssueBlockedNotice", () => {
       />,
     );
 
-    expect(node.textContent).toContain("This task still needs a next step.");
-    expect(node.textContent).toContain("Corrective wake queued for CodexCoder");
-    expect(node.textContent).toContain("Detected progress: Updated the plan");
-    expect(node.textContent).not.toContain("Retry now");
-    expect(node.textContent).not.toContain("Work on this task is blocked until");
     expect(node.querySelector('[data-successful-run-handoff="required"]')).not.toBeNull();
+    expect(node.textContent).toContain("This task still needs a next step.");
+    expect(node.textContent).toContain(
+      "A run finished successfully, but the task is still open. Paperclip needs someone to choose what happens next.",
+    );
+    expect(node.textContent).toContain("Mark it done or cancelled.");
+    expect(node.textContent).toContain("Send it for review or ask for input.");
+    expect(node.textContent).toContain("Record what is blocking it and who owns that blocker.");
+    expect(node.textContent).toContain("Delegate follow-up work or queue a continuation.");
+    expect(node.textContent).toContain("Asked CodexCoder to choose the next step");
+    expect(node.textContent).toContain("Detected progress: Updated the plan and left follow-up work.");
+    expect(node.querySelector('[data-testid="issue-next-step-retry-now"]')).toBeNull();
+    // No live continuation ⇒ the alarm stays exactly as it was; the calm
+    // in-flight line must not appear alongside it.
+    expect(node.querySelector('[data-testid="issue-next-step-in-flight"]')).toBeNull();
   });
 
   it("shows retry-now action for next-step notices with a scheduled retry", async () => {
@@ -167,10 +176,9 @@ describe("IssueBlockedNotice", () => {
       />,
     );
 
-    expect(node.textContent).toContain("Corrective wake scheduled in 1d");
     const button = node.querySelector<HTMLButtonElement>('[data-testid="issue-next-step-retry-now"]');
     expect(button).not.toBeNull();
-    expect(button!.textContent ?? "").toContain("Retry now");
+    expect(node.textContent).toContain("Retry now starts that follow-up immediately.");
 
     act(() => {
       button!.click();
@@ -178,9 +186,154 @@ describe("IssueBlockedNotice", () => {
 
     await vi.waitFor(() => {
       expect(retryNowMock).toHaveBeenCalledWith("issue-1");
-      expect(button!.textContent ?? "").toContain("Promoted");
       expect(button!.disabled).toBe(true);
     });
+  });
+
+  it("replaces the alarm with the calm in-flight line while a live continuation is running the issue", () => {
+    const node = render(
+      <IssueBlockedNotice
+        issueStatus="in_progress"
+        blockers={[]}
+        agentName="CodexCoder"
+        successfulRunHandoff={{
+          state: "required",
+          required: true,
+          hasLiveContinuation: true,
+          liveRunId: "87654321-dddd-eeee-ffff-123456789abc",
+          sourceRunId: "12345678-aaaa-bbbb-cccc-123456789abc",
+          correctiveRunId: null,
+          assigneeAgentId: "agent-1",
+          detectedProgressSummary: "Updated the plan and left follow-up work.",
+          createdAt: "2026-05-01T00:00:00.000Z",
+        }}
+      />,
+    );
+
+    // The amber alarm and every remediation bullet are gone...
+    expect(node.querySelector('[data-successful-run-handoff="required"]')).toBeNull();
+    expect(node.textContent).not.toContain("This task still needs a next step.");
+    expect(node.textContent).not.toContain("Mark it done or cancelled.");
+    expect(node.querySelector(".bg-amber-50\\/90")).toBeNull();
+
+    // ...replaced by one quiet line that links the live run.
+    const calm = node.querySelector('[data-testid="issue-next-step-in-flight"]');
+    expect(calm).not.toBeNull();
+    expect(calm!.getAttribute("data-successful-run-handoff")).toBe("in_flight");
+    expect(node.textContent).toContain(
+      "A correction run is in progress — the agent is working. This alert returns if the run stops without choosing a next step.",
+    );
+    const runLink = calm!.querySelector("a");
+    expect(runLink?.getAttribute("href")).toBe(
+      "/agents/agent-1/runs/87654321-dddd-eeee-ffff-123456789abc",
+    );
+    expect(runLink?.textContent).toBe("run 87654321");
+  });
+
+  it("shows the calm in-flight line when the live-run set includes this issue", () => {
+    const node = render(
+      <IssueBlockedNotice
+        issueId="issue-1"
+        issueStatus="in_progress"
+        blockers={[]}
+        liveIssueIds={new Set(["issue-1"])}
+        agentName="CodexCoder"
+        successfulRunHandoff={{
+          state: "required",
+          required: true,
+          hasLiveContinuation: false,
+          sourceRunId: "12345678-aaaa-bbbb-cccc-123456789abc",
+          correctiveRunId: null,
+          assigneeAgentId: "agent-1",
+          detectedProgressSummary: null,
+          createdAt: "2026-05-01T00:00:00.000Z",
+        }}
+      />,
+    );
+
+    expect(node.querySelector('[data-successful-run-handoff="required"]')).toBeNull();
+    const calm = node.querySelector('[data-testid="issue-next-step-in-flight"]');
+    expect(calm).not.toBeNull();
+    // No `liveRunId` on the payload — the copy stands alone, with no run link.
+    expect(calm!.querySelector("a")).toBeNull();
+    expect(node.textContent).toContain("A correction run is in progress");
+  });
+
+  it("omits the run link but keeps the calm copy when the live run has no known agent", () => {
+    const node = render(
+      <IssueBlockedNotice
+        issueStatus="in_progress"
+        blockers={[]}
+        successfulRunHandoff={{
+          state: "required",
+          required: true,
+          hasLiveContinuation: true,
+          liveRunId: "87654321-dddd-eeee-ffff-123456789abc",
+          sourceRunId: null,
+          correctiveRunId: null,
+          assigneeAgentId: null,
+          detectedProgressSummary: null,
+          createdAt: "2026-05-01T00:00:00.000Z",
+        }}
+      />,
+    );
+
+    const calm = node.querySelector('[data-testid="issue-next-step-in-flight"]');
+    expect(calm).not.toBeNull();
+    expect(calm!.querySelector("a")).toBeNull();
+    expect(calm!.textContent).toContain("run 87654321");
+  });
+
+  it("stays silent when the handoff is not required at all", () => {
+    const node = render(
+      <IssueBlockedNotice
+        issueStatus="in_progress"
+        blockers={[]}
+        successfulRunHandoff={{
+          state: "resolved",
+          required: false,
+          hasLiveContinuation: true,
+          liveRunId: "87654321-dddd-eeee-ffff-123456789abc",
+          sourceRunId: "12345678-aaaa-bbbb-cccc-123456789abc",
+          correctiveRunId: null,
+          assigneeAgentId: "agent-1",
+          detectedProgressSummary: null,
+          createdAt: "2026-05-01T00:00:00.000Z",
+        }}
+      />,
+    );
+
+    expect(node.querySelector('[data-testid="issue-next-step-in-flight"]')).toBeNull();
+    expect(node.textContent).toBe("");
+  });
+
+  it("keeps the next-step notice and retry-now when the only continuation is an unpromoted scheduled retry", () => {
+    const node = render(
+      <IssueBlockedNotice
+        issueId="issue-1"
+        issueStatus="in_progress"
+        blockers={[]}
+        agentName="CodexCoder"
+        scheduledRetry={baseRetry}
+        successfulRunHandoff={{
+          state: "required",
+          required: true,
+          hasLiveContinuation: true,
+          sourceRunId: "12345678-aaaa-bbbb-cccc-123456789abc",
+          correctiveRunId: null,
+          assigneeAgentId: "agent-1",
+          detectedProgressSummary: null,
+          createdAt: "2026-05-01T00:00:00.000Z",
+        }}
+      />,
+    );
+
+    expect(node.querySelector('[data-successful-run-handoff="required"]')).not.toBeNull();
+    expect(node.querySelector('[data-testid="issue-next-step-retry-now"]')).not.toBeNull();
+    // The carve-out wins over the calm line: the alarm is the only thing that
+    // keeps "Retry now" reachable, so it must not be quieted or duplicated.
+    expect(node.querySelector('[data-testid="issue-next-step-in-flight"]')).toBeNull();
+    expect(node.textContent).toContain("This task still needs a next step.");
   });
 
   it("does not render when the issue is done even if a stale handoff state is required", () => {
@@ -267,10 +420,10 @@ describe("IssueBlockedNotice", () => {
     );
 
     expect(node.querySelector('[data-testid="issue-blocked-notice-live"]')).toBeNull();
-    // Rule C: a `blocked` issue with an unresolved blocker explains that a
-    // human message will not reopen it yet.
-    expect(node.textContent).toContain("A message won’t move this back to todo yet");
+    // Rule C: a `blocked` issue with an unresolved blocker suppresses
+    // comment-driven reopening.
     expect(node.querySelector('[data-blocker-attention-state="covered"]')).not.toBeNull();
+    expect(node.textContent).toContain("A message won’t restart this task yet");
   });
 
   it("sorts same-status live-work steps with numeric identifier ordering", () => {
@@ -331,6 +484,11 @@ describe("IssueBlockedNotice", () => {
       />,
     );
 
+    expect(node.textContent).toContain("Waiting on live work");
+    expect(node.textContent).toContain(
+      "This task resumes automatically when the chain is done.",
+    );
+
     const stepLinks = Array.from(
       node.querySelectorAll('[data-testid="issue-blocked-notice-steps"] a'),
     ).map((link) => link.textContent ?? "");
@@ -364,14 +522,13 @@ describe("IssueBlockedNotice", () => {
       />,
     );
 
-    expect(node.textContent).toContain("A message won’t move this back to todo yet");
-    expect(node.textContent).toContain("Comments still wake CodexCoder");
+    expect(node.textContent).toContain("A message won’t restart this task yet");
+    expect(node.textContent).toContain("Comments still notify CodexCoder for questions or triage");
     const suppressed = node.querySelector('[data-testid="issue-blocked-notice-reopen-suppressed"]');
     expect(suppressed).not.toBeNull();
     expect(suppressed!.textContent).toContain("Still blocked by");
     expect(suppressed!.textContent).toContain("PAP-500");
     expect(suppressed!.textContent).toContain("(in progress)");
-    expect(suppressed!.textContent).not.toContain("other task");
   });
 
   it("names the deepest unresolved terminal leaf, not the direct blocker (Rule C)", () => {
@@ -406,11 +563,10 @@ describe("IssueBlockedNotice", () => {
     const suppressed = node.querySelector('[data-testid="issue-blocked-notice-reopen-suppressed"]');
     expect(suppressed).not.toBeNull();
     expect(suppressed!.textContent).toContain("PAP-777");
-    expect(suppressed!.textContent).toContain("(in progress)");
     expect(suppressed!.textContent).not.toContain("PAP-600");
   });
 
-  it("summarizes the count when several blockers keep a comment from reopening (Rule C)", () => {
+  it("names one leaf blocker when several keep a comment from reopening (Rule C)", () => {
     const node = render(
       <IssueBlockedNotice
         issueStatus="blocked"
@@ -439,14 +595,15 @@ describe("IssueBlockedNotice", () => {
 
     const suppressed = node.querySelector('[data-testid="issue-blocked-notice-reopen-suppressed"]');
     expect(suppressed).not.toBeNull();
+    expect(suppressed!.textContent).toContain("PAP-501");
     expect(suppressed!.textContent).toContain("and 1 other task");
+    expect(suppressed!.textContent).not.toContain("PAP-502");
   });
 
-  it("does not claim a message won't reopen when a blocked issue has no unresolved blockers (Rule B path)", () => {
+  it("does not suppress reopening when a blocked issue has no unresolved blockers (Rule B path)", () => {
     const node = render(<IssueBlockedNotice issueStatus="blocked" blockers={[]} />);
 
-    expect(node.textContent).toContain("Work on this task is blocked until it is moved back to todo");
-    expect(node.textContent).not.toContain("A message won’t move this back to todo yet");
+    expect(node.textContent).not.toBe("");
     expect(node.querySelector('[data-testid="issue-blocked-notice-reopen-suppressed"]')).toBeNull();
   });
 

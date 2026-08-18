@@ -63,8 +63,14 @@ export {
 export {
   REDACTED_COMMAND_TEXT_VALUE,
   redactCommandText,
+  redactDiagnosticText,
 } from "./command-redaction.js";
 export { buildSandboxNpmInstallCommand } from "./sandbox-install-command.js";
+export {
+  buildAdapterEnvConfig,
+  parseEnvBindings,
+  parseEnvVars,
+} from "./env-bindings.js";
 export { createRuntimeProgressReporter } from "./runtime-progress.js";
 export type {
   RuntimeProgressSink,

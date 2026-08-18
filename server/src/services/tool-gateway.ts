@@ -85,6 +85,14 @@ const DEFAULT_TOOL_TIMEOUT_MS = 10_000;
 // `tool_timeout` even though the approval succeeded. Give approved executions
 // the full permitted headroom instead.
 const APPROVED_EXECUTION_TIMEOUT_MS = 60_000;
+// The gateway creates an ask-first request in two steps: it inserts the row
+// with a null signature, then it signs the row and sets the expiry. A concurrent
+// matching call can observe the row in this window. A null signature alone does
+// not prove the create stopped; the create can still run in another request. Only
+// treat an unsigned row as abandoned after this grace time from createdAt. This
+// grace must exceed the normal sign path (approval-snapshot fetch + interaction
+// create) so a live create keeps its own row.
+const UNSIGNED_ACTION_REQUEST_ABANDON_MS = 2 * 60 * 1000;
 const MAX_REMOTE_MCP_RESPONSE_BYTES = 1_000_000;
 const ACTIVE_GATEWAY_RUN_STATUSES = new Set(["running"]);
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -1687,7 +1695,13 @@ export function createToolGatewayService(
       { agentId: input.session.agentId },
     );
 
-    await db
+    // Sign the row only while it is still pending. A concurrent matching call can
+    // expire this row when the create runs longer than the abandon grace time.
+    // Guard the update with the pending status so the sign step never resurrects
+    // an expired row. When the guard matches no row, the row is already resolved.
+    // Do not emit an approval card for a dead row; throw a retriable conflict so
+    // the retry finds the live request or creates a fresh, signable one.
+    const signedRows = await db
       .update(toolActionRequests)
       .set({
         interactionId: interaction.id,
@@ -1699,7 +1713,32 @@ export function createToolGatewayService(
         expiresAt,
         updatedAt: new Date(),
       })
-      .where(eq(toolActionRequests.id, actionRequest.id));
+      .where(and(eq(toolActionRequests.id, actionRequest.id), eq(toolActionRequests.status, "pending")))
+      .returning({ id: toolActionRequests.id });
+    if (signedRows.length === 0) {
+      await db
+        .update(toolInvocations)
+        .set({
+          status: "failed",
+          approvalState: "expired",
+          errorCode: "approval_request_superseded",
+          errorMessage: "The approval request was resolved before it could be signed",
+          completedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(toolInvocations.id, input.invocation.id));
+      throw new ToolGatewayHttpError(
+        409,
+        "The approval request was resolved before it could be signed",
+        "approval_request_superseded",
+        {
+          invocationId: input.invocation.id,
+          actionRequestId: actionRequest.id,
+          tool: input.tool.name,
+          instructions: "A parallel call already handled this approval. Retry the same call now to reach the live approval request.",
+        },
+      );
+    }
 
     await writeToolCallEvent({
       invocationId: input.invocation.id,
@@ -4070,6 +4109,39 @@ export function createToolGatewayService(
     return { reasonCode, message };
   }
 
+  // Guard for approved-action execution: the issue must still be open. Expires
+  // the claimed request and reflects the interaction lifecycle when it is not.
+  // Called twice — after winning the executing claim, and again immediately
+  // before provider dispatch, because tool/snapshot resolution between the two
+  // involves network calls and leaves a seconds-wide window for the issue to
+  // close.
+  async function assertIssueOpenForApprovedAction(input: {
+    claimed: typeof toolActionRequests.$inferSelect;
+    invocation: typeof toolInvocations.$inferSelect;
+  }): Promise<{ projectId: string | null }> {
+    const { claimed, invocation } = input;
+    const [issue] = await db
+      .select({ status: issues.status, projectId: issues.projectId })
+      .from(issues)
+      .where(and(eq(issues.id, invocation.issueId!), eq(issues.companyId, invocation.companyId)))
+      .limit(1);
+    if (issue && issue.status !== "done" && issue.status !== "cancelled") {
+      return { projectId: issue.projectId };
+    }
+    const expiredAt = new Date();
+    await db
+      .update(toolActionRequests)
+      .set({ status: "expired", resolvedAt: expiredAt, updatedAt: expiredAt })
+      .where(eq(toolActionRequests.id, claimed.id));
+    await reflectToolActionInteractionLifecycle({ actionRequestId: claimed.id, status: "expired" });
+    throw new ToolGatewayHttpError(
+      409,
+      "The issue for this tool action is closed; the approval has expired",
+      "action_issue_closed",
+      { actionRequestId: claimed.id, invocationId: invocation.id },
+    );
+  }
+
   async function executeApprovedAgentInvocation(input: {
     actionRequest: typeof toolActionRequests.$inferSelect;
     invocation: typeof toolInvocations.$inferSelect;
@@ -4105,6 +4177,12 @@ export function createToolGatewayService(
       throw new ToolGatewayHttpError(409, "Tool action request was already consumed", "action_already_consumed");
     }
 
+    // Terminal-issue expiry revokes pending/approved requests, but a claim that
+    // committed just before the issue closed slips past that revocation. Recheck
+    // the issue after winning the claim so a governed action never runs external
+    // side effects for an issue that is already done or cancelled.
+    const issue = await assertIssueOpenForApprovedAction({ claimed, invocation });
+
     const signedPayload = readSignedToolArgumentsPayload({
       signedArguments: claimed.signedArguments,
       invocationId: invocation.id,
@@ -4124,11 +4202,6 @@ export function createToolGatewayService(
       );
     }
 
-    const [issue] = await db
-      .select({ projectId: issues.projectId })
-      .from(issues)
-      .where(and(eq(issues.id, invocation.issueId), eq(issues.companyId, invocation.companyId)))
-      .limit(1);
     const session: ToolGatewaySession = {
       id: `approved-action:${claimed.id}`,
       token: "",
@@ -4184,6 +4257,17 @@ export function createToolGatewayService(
       sensitiveMode: "redact",
       promptInjectionMode: "ignore",
     }).summary;
+    // Final recheck at the last DB write before dispatch: tool and snapshot
+    // resolution above involve network calls, so re-verify the issue is still
+    // open now that only the provider call remains. A close that commits after
+    // this read has raced an execution that was approved, claimed, and verified
+    // while the issue was open; that instant is irreducible for an external
+    // side effect gated by DB state (holding a DB lock across a remote provider
+    // call is not an option), and the accepted linearization is that the
+    // execution wins — its result still lands on the expired card via
+    // reflectToolActionInteractionLifecycle.
+    await assertIssueOpenForApprovedAction({ claimed, invocation });
+
     const startedAt = Date.now();
     await db
       .update(toolInvocations)
@@ -4280,11 +4364,28 @@ export function createToolGatewayService(
       .orderBy(desc(toolActionRequests.createdAt))
       .limit(1);
     if (!match) return null;
-    if (
-      match.actionRequest.status === "pending"
-      && match.actionRequest.expiresAt
-      && match.actionRequest.expiresAt.getTime() <= Date.now()
-    ) {
+    // The gateway builds an ask-first request in two steps inside one call: it
+    // inserts the row with a null signature and a null expiry, then signs the
+    // row and sets the expiry. A concurrent matching call can observe the row in
+    // this window. A null signature does not prove the create stopped, because a
+    // parallel create can still be signing the same row right now. Only treat an
+    // unsigned row as abandoned after the grace time from createdAt has passed;
+    // before that, return the match so the retry replays approval_required and
+    // does not create a duplicate request or expire a live row. After the grace
+    // time an unsigned row stays pending forever and the review queue hides it,
+    // so it can never be approved. Do not replay it as a live approval. Expire
+    // the row and let the retry create a fresh, signable request. A null expiry
+    // alone (without this guard) also makes the getTime() check below unsafe.
+    const pendingRequest = match.actionRequest;
+    const pendingUnsigned =
+      pendingRequest.status === "pending"
+      && pendingRequest.signedArguments === null
+      && Date.now() - pendingRequest.createdAt.getTime() >= UNSIGNED_ACTION_REQUEST_ABANDON_MS;
+    const pendingExpired =
+      pendingRequest.status === "pending"
+      && pendingRequest.expiresAt !== null
+      && pendingRequest.expiresAt.getTime() <= Date.now();
+    if (pendingUnsigned || pendingExpired) {
       const now = new Date();
       await db.update(toolActionRequests).set({ status: "expired", resolvedAt: now, updatedAt: now }).where(and(
         eq(toolActionRequests.id, match.actionRequest.id),

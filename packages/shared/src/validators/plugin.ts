@@ -18,6 +18,8 @@ import {
   PLUGIN_API_ROUTE_METHODS,
   ISSUE_PRIORITIES,
   ROUTINE_CATCH_UP_POLICIES,
+  ROUTINE_ACTIVITY_GATE_POLICIES,
+  ROUTINE_ACTIVITY_GATE_SCOPES,
   ROUTINE_CONCURRENCY_POLICIES,
   ROUTINE_STATUSES,
   ROUTINE_TRIGGER_KINDS,
@@ -153,6 +155,21 @@ export const pluginEnvironmentTemplateConfigBindingSchema = z.object({
   }
 });
 
+// The nested sandbox capability declaration is `.strict()` so an unknown
+// capability key is a validation error, not a silently dropped field. The outer
+// driver schema below is non-strict and drops unknown top-level keys, so the
+// declaration itself is the gate that a typo in a capability name cannot pass.
+export const sandboxProviderCapabilitiesSchema = z.object({
+  reusableLeases: z.boolean().optional(),
+  nativeSyncIn: z.boolean().optional(),
+  nativeSyncOut: z.boolean().optional(),
+  persistentProcessSessions: z.boolean().optional(),
+  independentControlCommands: z.boolean().optional(),
+  incrementalSessionOutput: z.boolean().optional(),
+}).strict();
+
+export type SandboxProviderCapabilitiesInput = z.infer<typeof sandboxProviderCapabilitiesSchema>;
+
 export const pluginEnvironmentDriverDeclarationSchema = z.object({
   driverKey: z.string().min(1).regex(
     /^[a-z0-9][a-z0-9._-]*$/,
@@ -162,6 +179,7 @@ export const pluginEnvironmentDriverDeclarationSchema = z.object({
   displayName: z.string().min(1).max(100),
   description: z.string().max(500).optional(),
   supportsReusableLeases: z.boolean().optional(),
+  sandboxCapabilities: sandboxProviderCapabilitiesSchema.optional(),
   supportsInteractiveSetup: z.boolean().optional(),
   interactiveSetupConnectionTypes: z.array(z.string().min(1).max(100)).max(10).optional(),
   supportsTemplateCapture: z.boolean().optional(),
@@ -169,6 +187,7 @@ export const pluginEnvironmentDriverDeclarationSchema = z.object({
   templateConfigBinding: pluginEnvironmentTemplateConfigBindingSchema.optional(),
   templateIdentityPaths: z.array(z.string().min(1).max(200)).max(20).optional(),
   supportsTemplateDelete: z.boolean().optional(),
+  supportsSetupTokenLogin: z.boolean().optional(),
   configSchema: jsonSchemaSchema,
 });
 
@@ -238,6 +257,8 @@ export const pluginManagedRoutineDeclarationSchema = z.object({
   priority: z.enum(ISSUE_PRIORITIES).optional(),
   concurrencyPolicy: z.enum(ROUTINE_CONCURRENCY_POLICIES).optional(),
   catchUpPolicy: z.enum(ROUTINE_CATCH_UP_POLICIES).optional(),
+  activityGatePolicy: z.enum(ROUTINE_ACTIVITY_GATE_POLICIES).optional(),
+  activityGateScope: z.enum(ROUTINE_ACTIVITY_GATE_SCOPES).optional(),
   variables: z.array(routineVariableSchema).optional(),
   triggers: z.array(z.object({
     kind: z.enum(ROUTINE_TRIGGER_KINDS),
